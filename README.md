@@ -19,6 +19,28 @@
 
 **pyVideoTrans** is dedicated to seamlessly converting videos from one language to another, offering a complete workflow that includes speech recognition, subtitle translation, multi-role dubbing, and audio-video synchronization. It supports both local offline deployment and a wide variety of mainstream online APIs.
 
+## Denne kopi
+
+Denne kopi dubber engelsk tale til dansk i en Podman-container med ROCm på et AMD-grafikkort. Start den med `./pyvideotrans.sh start`. WebUI ligger på `http://127.0.0.1:7860`. Læg film i `data/in`. Færdige filer, undertekster og indstillinger ligger i `data/`. Efter en kodeændring skal imaget bygges igen med `./pyvideotrans.sh rebuild`.
+
+Stemmer:
+
+- **Én stemme pr. sætning** er slået til. Hver replik klones fra sit eget stykke af den originale tale.
+- **Hver taler får sin egen stemme** kan slås til i stedet, så en scene deler én reference.
+- **Audio Speedup** forkorter for lang tale, så filmen beholder sin længde. **Video Slowdown** gør filmen længere og er slået fra.
+
+Billedet kopieres som det er. Det omkodes kun, hvis kopien fejler. **Tilføj dubbet lydspor** lægger det danske spor oven i den originale fil. En MKV forbliver MKV og beholder det oprindelige billede, den oprindelige lyd og underteksterne. Det nye spor får sprogkoden fra målsproget og er standardsporet. En MP4 får kun billede og lyd, fordi den ikke kan rumme SRT-undertekster.
+
+Undertekster:
+
+- **Undertekst på talesproget** og **Undertekst på målsproget** er en reference til oversætteren. Én fil er nok. Den danske fil lægges i målsproget, den engelske i talesproget. Linjer matches inden for 4 sekunder. Whisper-tidsstemplerne beholdes.
+- Når referencen ikke siger det samme som genkendelsen, bruges referencens ordlyd. En misforstået gentagelse bliver altså ikke oversat ordret. Talte udråb som badabum forbliver tale.
+- En hel linje, som oversætteren markerer `[SONG]`, fjernes fra underteksterne. Kort talt "åh" bliver oversat.
+- **Ryd tidligere output** sletter denne films undertekster og cache. Lad den være slået fra, hvis en rettet `da.srt` skal bruges igen.
+- Oversættelsesloggen viser batchnummer og antal, for eksempel `Translate 10/50`.
+
+Vokalseparation kører på CPU. Afkrydsningen CUDA sender PyTorch-modellerne, blandt andet Whisper og Chatterbox, til grafikkortet. Oversættelsen går til en lokal OpenAI-kompatibel server. Modelnavnet vælges i WebUI.
+
 
 <img width="1730" height="957" alt="image" src="https://github.com/user-attachments/assets/25d78661-8b73-4f34-a3e5-205c7daba99b" />
 
