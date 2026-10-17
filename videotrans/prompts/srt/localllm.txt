@@ -11,7 +11,9 @@ The output must be a clean, dubbing-ready SRT file where every block strictly ma
    - The total number of output subtitle blocks MUST be EXACTLY equal to the input.
    - If the input contains N blocks (Index 1 to N), your output MUST contain N blocks (Index 1 to N). The final block index MUST be identical.
    - **NEVER MERGE**: Never combine two or more blocks into one, even if a sentence is awkwardly split mid-word or mid-phrase.
-   - **NEVER DELETE**: Never drop short words, interjections ("oh", "well"), non-verbal cues, or silence blocks. Every single input block must yield a corresponding output block.
+   - **NEVER DELETE**: Never drop a block. Every input block must yield one output block with the same index and timestamp.
+   - **SINGING**: If the whole block is sung (repeated syllables such as "oh, oh, oh", or actual song lyrics) and it is not spoken dialogue, keep the block and set its text line to exactly `[SONG]`. A spoken "Oh.", "Oh no", or any short reaction inside a conversation is dialogue and must be translated. A spoken exclamation such as "boom", "big bada boom", or "badaboom" is dialogue. Translate it. Never mark it `[SONG]`.
+   - **REFERENCE**: When `<REFERENCE>` has lines, they belong to the same moment, within a few seconds. `TARGET:` is what was actually said. `SPOKEN:` is the original wording. Either side may be absent. If INPUT repeats one short phrase, or INPUT's meaning is not what TARGET says, write TARGET's meaning and drop the misheard INPUT words. Example: INPUT "I'm a virgin" repeated, TARGET "Big bada boom.", output the bada-boom wording, not a translation of "virgin", and not `[SONG]`. Split one TARGET line across the INPUT blocks it covers. Keep every INPUT index and timestamp. Never output the REFERENCE lines, and never copy their timestamps.
 
 2. **IMMUTABLE METADATA ANCHORS**:
    - For every block, you must mirror the exact **Index Number** and **Timestamp line** from the input without modification.
@@ -27,7 +29,7 @@ The output must be a clean, dubbing-ready SRT file where every block strictly ma
 
 1. **ZERO-SHIFT FRAGMENT TRANSLATION (NO CROSS-BLOCK MIGRATION)**:
    - Due to natural speech pauses, single sentences are often split across multiple blocks.
-   - **Local Translation Only**: Translate ONLY the words physically present inside each isolated block.
+   - **Local Translation Only**: Translate ONLY the words physically present inside each isolated block. This does not apply when REFERENCE disagrees with INPUT: follow REFERENCE for that block.
    - **Do NOT Shift Grammar**: Do NOT shift nouns, verbs, or objects from Block 1 to Block 2 (or vice-versa) to satisfy {lang} grammar.
    - **Punctuation Bridging**: If an input block ends mid-clause, end its translation with an ellipsis (`...`). If the next block continues it, start that translation with an ellipsis (`...`). This keeps the fragments aligned and signals the TTS engine to sustain pitch.
 
@@ -87,3 +89,10 @@ Yeah.
 <INPUT>
 {batch_input}
 </INPUT>
+
+<REFERENCE>
+{reference}
+</REFERENCE>
+
+# APPLY REFERENCE
+TARGET is what was actually said. If a block does not mean the same as the TARGET line closest to it, replace that block's text with the TARGET wording. Split one TARGET line across the INPUT blocks it covers. Keep every INPUT index and timestamp. Do not translate a misheard INPUT. Spoken exclamations in TARGET, such as badabum, stay dialogue and are never [SONG].

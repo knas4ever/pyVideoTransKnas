@@ -60,10 +60,18 @@ class AssembleMixin:
     def _join_video_audio_srt(self) -> None:
         if self._exit() or not self.should_hebing:
             return
-        self.signal(text="Checking novoice.mp4...")
-        is_novoice_mp4(self.cfg.novoice_mp4, self.uuid)
-        if not Path(self.cfg.novoice_mp4).exists():
-            raise VideoTransError(f'{self.cfg.novoice_mp4} 不存在')
+        from videotrans.task._mux import audio_language_tag, keeps_original_streams, mux_command, output_ext_for_mux
+
+        mux_original = keeps_original_streams(
+            mux_audio=settings.get("mux_audio", True),
+            video_autorate=self.cfg.video_autorate,
+            subtitle_type=self.cfg.subtitle_type,
+        )
+        if not mux_original:
+            self.signal(text="Checking novoice.mp4...")
+            is_novoice_mp4(self.cfg.novoice_mp4, self.uuid)
+            if not Path(self.cfg.novoice_mp4).exists():
+                raise VideoTransError(f'{self.cfg.novoice_mp4} 不存在')
 
         if self.should_dubbing and not vail_file(self.cfg.target_wav):
             raise VideoTransError(f"{tr('Dubbing')}{tr('anerror')}:{self.cfg.target_wav}")
@@ -71,7 +79,10 @@ class AssembleMixin:
         self.precent = min(max(90, self.precent), 98)
         target_m4a = self.cfg.cache_folder + "/will_embed.m4a"
         output_source_output = True
-        duration_ms = int(get_video_duration(self.cfg.novoice_mp4))
+        if mux_original:
+            duration_ms = int(self.video_time or get_video_duration(self.cfg.name))
+        else:
+            duration_ms = int(get_video_duration(self.cfg.novoice_mp4))
         if not self.should_dubbing:
             self.signal(text=tr("Get original sound..."))
             self._get_origin_audio(target_m4a,duration_ms)
@@ -116,6 +127,8 @@ class AssembleMixin:
         shutil.copy2(target_m4a, self.cfg.target_wav_output)
         self.precent = min(max(95, self.precent), 98)
         _video_output_ext = settings.get('out_video_ext', '.mp4')
+        if mux_original:
+            _video_output_ext = output_ext_for_mux(self.cfg.name, _video_output_ext)
         subtitles_file, subtitle_langcode = None, None
         if self.cfg.subtitle_type > 0:
             self.signal(text=tr("Organize subtitles for embedding..."))
@@ -137,121 +150,144 @@ class AssembleMixin:
         self.signal(text=tr("Video + Subtitles + Dubbing in merge"))
 
         try:
-            protxt = self.cfg.cache_folder + f"/compose{time.time()}.txt"
-            protxt_basename = os.path.basename(protxt)
-            threading.Thread(target=self._hebing_pro, args=(protxt,), daemon=True).start()
-
-            novoice_mp4_basename = os.path.basename(self.cfg.novoice_mp4)
-            target_m4a_basename = os.path.basename(target_m4a)
-            tmp_target_mp4_basename = os.path.basename(tmp_target_mp4)
-
-            if not app_cfg.video_codec:
-                self.signal(text=tr("Check supported hardware codes..."))
-                app_cfg.video_codec = get_video_codec()
-
-            cmd0 = [
-                "-y",
-                "-progress",
-                protxt_basename
-            ]
-
-            cmd1 = [
-                "-i",
-                novoice_mp4_basename,
-                "-i",
-                target_m4a_basename
-            ]
-            enc_qua = ['-crf', f'{settings.get("crf", 23)}', '-preset', settings.get('preset', 'medium')]
-
-            fps_mode=None
-            if settings.get('fps_mode')=='cfr':
-                fps_mode=["-r",f"{self.video_info['video_fps']}","-fps_mode","cfr"]
-            elif self.cfg.video_autorate:
-                fps_mode=["-fps_mode","vfr"]
-            if self.cfg.subtitle_type not in [1, 3]:
-                if self.cfg.subtitle_type in [2, 4]:
-                    cmd1.extend(["-i", subtitles_file])
-                cmd1.extend([
-                    '-map',
-                    '0:v',
-                    '-map',
-                    '1:a'
-                ])
-                if self.cfg.subtitle_type in [2, 4]:
-                    cmd1.extend(['-map', '2:s'])
-
-                cmd1.extend([
-                    "-c:v",
-                    "copy"  if is_copy_mode else f"libx{self.video_codec_num}",
-                    "-c:a",
-                    "copy",
-                ])
-                if self.cfg.subtitle_type in [2, 4]:
-                    cmd1.extend([
-                        "-c:s",
-                        "mov_text" if _video_output_ext == '.mp4' else 'srt',
-                        "-metadata:s:s:0",
-                        f"language={subtitle_langcode}"
-                    ])
-
-                cmd2 = [
-                    "-movflags",
-                    "+faststart",
-                ]
-                if fps_mode:
-                    cmd2.extend(fps_mode)
-
-                cmd2.extend([tmp_target_mp4_basename])
-                if is_copy_mode:
-                    logger.debug(f'[最终视频合成]copy模式，无需重新编码:\n{cmd0 + cmd1 + cmd2}')
-                    runffmpeg(cmd0 + cmd1 + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
-                elif app_cfg.video_codec.startswith('libx') or settings.get('force_lib'):
-                    logger.debug(f'[最终视频合成]不支持硬件编码或指定了强制软编解码:\n{cmd0 + cmd1 + cmd2}')
-                    runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
-                else:
-                    hw_decode_args, _, vcodec, enc_args = self._get_hard_cfg()
-                    cmd1[cmd1.index('-c:v') + 1] = vcodec
-                    try:
-                        self._subprocess(cmd0 + hw_decode_args + cmd1 + enc_args + cmd2)
-                    except Exception as e:
-                        cmd1[cmd1.index('-c:v') + 1] = f'libx{self.video_codec_num}'
-                        logger.exception(f'硬件处理视频合成失败，回退软编 {e}', exc_info=True)
-                        logger.debug(f'cmd=\n{cmd0 + cmd1 + enc_qua + cmd2}')
-                        runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
-
+            if mux_original:
+                self.signal(text=tr("Add dubbed audio track"))
+                language = audio_language_tag(
+                    self.cfg.target_language_code,
+                    mkv=_video_output_ext != ".mp4",
+                )
+                title = self.cfg.target_language or language
+                streams = 0
+                if isinstance(self.video_info, dict):
+                    streams = self.video_info.get("streams_audio") or 0
+                protxt = self.cfg.cache_folder + f"/compose{time.time()}.txt"
+                cmd = ["-progress", os.path.basename(protxt)] + mux_command(
+                    self.cfg.name,
+                    target_m4a,
+                    tmp_target_mp4,
+                    language=language,
+                    title=title,
+                    audio_streams=streams,
+                )
+                logger.debug(f"[Mux] original + dubspor {language}: {' '.join(cmd)}")
+                threading.Thread(target=self._hebing_pro, args=(protxt,), daemon=True).start()
+                runffmpeg(cmd, cmd_dir=self.cfg.cache_folder, force_cpu=True)
             else:
-                cmd1.append('-filter_complex')
-                subtitle_filter = [f"[0:v]subtitles=filename='{subtitles_file}'[v_out]"]
-                cmd2 = [
-                    "-map",
-                    "[v_out]",
-                    "-map",
-                    "1:a",
-                    "-c:v",
-                    f'libx{self.video_codec_num}',
-                    '-c:a',
-                    'copy',
-                ]
-                cmd3 = ["-movflags", "+faststart"]
+                protxt = self.cfg.cache_folder + f"/compose{time.time()}.txt"
+                protxt_basename = os.path.basename(protxt)
+                threading.Thread(target=self._hebing_pro, args=(protxt,), daemon=True).start()
 
-                if fps_mode:
-                    cmd3.extend(fps_mode)
-                cmd3.extend([ tmp_target_mp4_basename])
-                if app_cfg.video_codec.startswith('libx') or settings.get('force_lib'):
-                    logger.debug(f'[最终视频合成]不支持硬件编解码或指定了强制软编解码:\n{cmd0 + cmd1 + cmd2}')
-                    runffmpeg(cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3,
-                                    cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                novoice_mp4_basename = os.path.basename(self.cfg.novoice_mp4)
+                target_m4a_basename = os.path.basename(target_m4a)
+                tmp_target_mp4_basename = os.path.basename(tmp_target_mp4)
+
+                if not app_cfg.video_codec:
+                    self.signal(text=tr("Check supported hardware codes..."))
+                    app_cfg.video_codec = get_video_codec()
+
+                cmd0 = [
+                    "-y",
+                    "-progress",
+                    protxt_basename
+                ]
+
+                cmd1 = [
+                    "-i",
+                    novoice_mp4_basename,
+                    "-i",
+                    target_m4a_basename
+                ]
+                enc_qua = ['-crf', f'{settings.get("crf", 23)}', '-preset', settings.get('preset', 'medium')]
+
+                fps_mode=None
+                if settings.get('fps_mode')=='cfr':
+                    fps_mode=["-r",f"{self.video_info['video_fps']}","-fps_mode","cfr"]
+                elif self.cfg.video_autorate:
+                    fps_mode=["-fps_mode","vfr"]
+                if self.cfg.subtitle_type not in [1, 3]:
+                    if self.cfg.subtitle_type in [2, 4]:
+                        cmd1.extend(["-i", subtitles_file])
+                    cmd1.extend([
+                        '-map',
+                        '0:v',
+                        '-map',
+                        '1:a'
+                    ])
+                    if self.cfg.subtitle_type in [2, 4]:
+                        cmd1.extend(['-map', '2:s'])
+
+                    cmd1.extend([
+                        "-c:v",
+                        "copy"  if is_copy_mode else f"libx{self.video_codec_num}",
+                        "-c:a",
+                        "copy",
+                    ])
+                    if self.cfg.subtitle_type in [2, 4]:
+                        cmd1.extend([
+                            "-c:s",
+                            "mov_text" if _video_output_ext == '.mp4' else 'srt',
+                            "-metadata:s:s:0",
+                            f"language={subtitle_langcode}"
+                        ])
+
+                    cmd2 = [
+                        "-movflags",
+                        "+faststart",
+                    ]
+                    if fps_mode:
+                        cmd2.extend(fps_mode)
+
+                    cmd2.extend([tmp_target_mp4_basename])
+                    if is_copy_mode:
+                        logger.debug(f'[最终视频合成]copy模式，无需重新编码:\n{cmd0 + cmd1 + cmd2}')
+                        runffmpeg(cmd0 + cmd1 + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                    elif app_cfg.video_codec.startswith('libx') or settings.get('force_lib'):
+                        logger.debug(f'[最终视频合成]不支持硬件编码或指定了强制软编解码:\n{cmd0 + cmd1 + cmd2}')
+                        runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                    else:
+                        hw_decode_args, _, vcodec, enc_args = self._get_hard_cfg()
+                        cmd1[cmd1.index('-c:v') + 1] = vcodec
+                        try:
+                            self._subprocess(cmd0 + hw_decode_args + cmd1 + enc_args + cmd2)
+                        except Exception as e:
+                            cmd1[cmd1.index('-c:v') + 1] = f'libx{self.video_codec_num}'
+                            logger.exception(f'硬件处理视频合成失败，回退软编 {e}', exc_info=True)
+                            logger.debug(f'cmd=\n{cmd0 + cmd1 + enc_qua + cmd2}')
+                            runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
+
                 else:
-                    try:
-                        hw_decode_args, vf_string, vcodec, enc_args = self._get_hard_cfg(subtitles_file)
-                        cmd2[cmd2.index('-c:v') + 1] = vcodec
-                        self._subprocess(cmd0 + hw_decode_args + cmd1 + [vf_string] + cmd2 + enc_args + cmd3)
-                    except Exception as e:
-                        cmd2[cmd2.index('-c:v') + 1] = f'libx{self.video_codec_num}'
-                        logger.exception(f'硬件处理视频合成失败，回退软编 {e}', exc_info=True)
-                        logger.debug(f'cmd=\n{cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3}')
+                    cmd1.append('-filter_complex')
+                    subtitle_filter = [f"[0:v]subtitles=filename='{subtitles_file}'[v_out]"]
+                    cmd2 = [
+                        "-map",
+                        "[v_out]",
+                        "-map",
+                        "1:a",
+                        "-c:v",
+                        f'libx{self.video_codec_num}',
+                        '-c:a',
+                        'copy',
+                    ]
+                    cmd3 = ["-movflags", "+faststart"]
+
+                    if fps_mode:
+                        cmd3.extend(fps_mode)
+                    cmd3.extend([ tmp_target_mp4_basename])
+                    if app_cfg.video_codec.startswith('libx') or settings.get('force_lib'):
+                        logger.debug(f'[最终视频合成]不支持硬件编解码或指定了强制软编解码:\n{cmd0 + cmd1 + cmd2}')
                         runffmpeg(cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3,
                                         cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                    else:
+                        try:
+                            hw_decode_args, vf_string, vcodec, enc_args = self._get_hard_cfg(subtitles_file)
+                            cmd2[cmd2.index('-c:v') + 1] = vcodec
+                            self._subprocess(cmd0 + hw_decode_args + cmd1 + [vf_string] + cmd2 + enc_args + cmd3)
+                        except Exception as e:
+                            cmd2[cmd2.index('-c:v') + 1] = f'libx{self.video_codec_num}'
+                            logger.exception(f'硬件处理视频合成失败，回退软编 {e}', exc_info=True)
+                            logger.debug(f'cmd=\n{cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3}')
+                            runffmpeg(cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3,
+                                            cmd_dir=self.cfg.cache_folder, force_cpu=True)
         except Exception as e:
             raise VideoTransError(tr('Error in embedding the final step of the subtitle dubbing')+str(e)) from e
 

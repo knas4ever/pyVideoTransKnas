@@ -14,8 +14,12 @@ Requires: uv sync --extra webui
 
 import sys
 import json
+import queue
+import re
+import threading
 import time
 import asyncio
+import traceback
 from pathlib import Path
 from typing import List
 
@@ -36,6 +40,24 @@ from videotrans.webui_i18n import tr  # noqa: E402
 # ---------------------------------------------------------------------------
 from videotrans.configure import config, constants  # noqa: E402
 
+# A download callback reports "file.pt:88.00%" about once a second. Keep that
+# as one Execution Log line so a multi-gigabyte model does not push the
+# percent out of the text box.
+_DOWNLOAD_PROGRESS = re.compile(r"^(?P<head>.*):(?:\d+\.\d+%|\d+\.\d+MB)$")
+
+
+def _append_exec_log(lines, msg, clock):
+    text = f"[{clock}] {msg}"
+    match = _DOWNLOAD_PROGRESS.match(str(msg).strip())
+    if match and lines:
+        previous = lines[-1].split("] ", 1)[-1]
+        prev = _DOWNLOAD_PROGRESS.match(previous.strip())
+        if prev and prev.group("head") == match.group("head"):
+            lines[-1] = text
+            return "\n".join(lines)
+    lines.append(text)
+    return "\n".join(lines)
+
 config.init_run()
 
 from videotrans.configure.config import ROOT_DIR, TEMP_DIR, app_cfg, params, settings
@@ -44,6 +66,9 @@ from videotrans.configure.constants import FASTER_MODELS_DICT, DEEPGRAM_ASR_MODE
 from videotrans import recognition, translator, tts
 from videotrans.util import tools
 from videotrans.util.gpus import getset_gpu
+from videotrans.util.help_ffmpeg import runffmpeg
+from videotrans.util._ffmpeg_audio import test_clip_args, test_clip_target
+from videotrans.task._speaker_refs import speaker_cap_to_nums
 from videotrans.util.help_role import role_menu
 
 # ---------------------------------------------------------------------------
@@ -64,13 +89,18 @@ def _load_params() -> dict:
 
 
 def _save_params(data: dict):
-    """保存到 params.json"""
+    """Merge into params.json. A partial write used to replace the whole file."""
+    current = _load_params()
+    if not isinstance(current, dict):
+        current = {}
+    current.update(data)
     PARAMS_JSON.parent.mkdir(parents=True, exist_ok=True)
     PARAMS_JSON.write_text(
-        json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8"
+        json.dumps(current, ensure_ascii=False), encoding="utf-8"
     )
-    # 同步更新内存中的 params
-    params.getset_params(data)
+    params.getset_params(current)
+    _user_params.clear()
+    _user_params.update(current)
 
 
 def _load_settings() -> dict:
@@ -82,12 +112,39 @@ def _load_settings() -> dict:
     return {}
 
 
+def apply_settings_update(current, update):
+    """Merge one saved section into the existing cfg. A section used to replace the file."""
+    base = dict(current) if isinstance(current, dict) else {}
+    base.update(update)
+    return base
+
+
 def _save_settings(data: dict):
+    current = apply_settings_update(_load_settings(), data)
     SETTINGS_JSON.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_JSON.write_text(
-        json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8"
+        json.dumps(current, ensure_ascii=False), encoding="utf-8"
     )
     settings.parse_init(data)
+    _user_settings.clear()
+    _user_settings.update(current)
+
+
+def setting_widget_value(key, current):
+    """Value a advanced-settings widget should show for one cfg entry."""
+    raw = current.get(key, "")
+    if isinstance(raw, bool):
+        text = "true" if raw else "false"
+    else:
+        text = str(raw)
+    if key in ComboBox_List:
+        options = ComboBox_Data.get(key) or []
+        if text in options:
+            return text
+        return options[0] if options else text
+    if text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    return text
 
 
 # 加载当前配置
@@ -106,23 +163,19 @@ LANGNAME_DICT: dict = translator.LANGNAME_DICT
 # 可选渠道索引
 # ---------------------------------------------------------------------------
 SELECTABLE_RECOGN = {0, 1, 2, 3, 4}
-DEFAULT_RECOGN = 0
-SELECTABLE_TRANSLATE = {0, 1, 2}
-DEFAULT_TRANSLATE = 0
-SELECTABLE_TTS = {0, 1, 3, 4, 5, 6, 7, 31}
-DEFAULT_TTS = 0
+DEFAULT_RECOGN = recognition.OPENAI_WHISPER
+SELECTABLE_TRANSLATE = {0, 1, 2, translator.HYMT2_INDEX}
+DEFAULT_TRANSLATE = translator.HYMT2_INDEX
+SELECTABLE_TTS = {0, 1, 3, 4, 5, 6, 7, 8, 31}
+DEFAULT_TTS = tts.CHATTERBOX_TTS
 
 FASTER_MODEL_NAMES = list(FASTER_MODELS_DICT.keys())
-DEFAULT_MODEL = (
-    "large-v3-turbo"
-    if "large-v3-turbo" in FASTER_MODEL_NAMES
-    else FASTER_MODEL_NAMES[0]
-)
+DEFAULT_MODEL = "large-v3"
 
 LANG_DISPLAY_NAMES = list(LANGNAME_DICT.values())
 LANG_CHOICES = [(name, code) for code, name in LANGNAME_DICT.items()]
-DEFAULT_SOURCE_LANG = next(iter(LANGNAME_DICT))
-DEFAULT_TARGET_LANG = "-"
+DEFAULT_SOURCE_LANG = "en"
+DEFAULT_TARGET_LANG = "da"
 
 SUBTITLE_TYPES = {
     tr("No subtitles"): 0,
@@ -215,12 +268,113 @@ def _format_pitch(v):
     return f"+{v}Hz" if v >= 0 else f"{v}Hz"
 
 
+def _speaker_summary(cache_folder, target_dir):
+    from collections import Counter
+
+    for folder in (cache_folder, target_dir):
+        path = Path(folder) / "speaker.json"
+        if not path.is_file():
+            continue
+        try:
+            ids = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(ids, list) or not ids:
+            continue
+        counts = Counter(str(item) for item in ids if item)
+        if counts:
+            text = ", ".join(f"{name} ({count})" for name, count in counts.items())
+            return tr("Speakers found: {}", text)
+    return tr("No speaker labels were produced. Each line is cloned from its own audio.")
+
+
 def _safe_get(key, default=""):
     """从 _user_params 读取值，支持 str/int/float/bool"""
     v = _user_params.get(key, default)
     if v is None:
         return default
     return v
+
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _param_bool(key, default=False):
+    if key not in _user_params:
+        return default
+    return _as_bool(_user_params.get(key), default)
+
+
+def _param_int(key, default=0):
+    try:
+        return int(_user_params.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _saved_index(key, names, default):
+    idx = _param_int(key, default)
+    if idx < 0 or idx >= len(names):
+        return default if 0 <= default < len(names) else 0
+    return idx
+
+
+def _percent_int(key, default=0):
+    raw = str(_user_params.get(key, default)).replace("%", "").replace("Hz", "").strip()
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
+def _pick_role(roles, current):
+    if not roles:
+        return "No"
+    if current in roles:
+        return current
+    if "clone" in roles:
+        return "clone"
+    return roles[0]
+
+
+def _option_label(options, idx):
+    keys = list(options)
+    if 0 <= idx < len(keys):
+        return keys[idx]
+    return keys[0]
+
+
+def _models_for_recogn(idx):
+    """Model names for an ASR channel. disabled=True when the channel has no model list."""
+    disabled = False
+    if idx in [recognition.FASTER_WHISPER, recognition.Faster_Whisper_XXL, recognition.WHISPERX_API]:
+        models = constants.WHISPER_MODELS.split(",")
+    elif idx == recognition.OPENAI_WHISPER:
+        models = OPENAI_WHISPER_MODELS.split(",")
+    elif idx == recognition.Deepgram:
+        models = DEEPGRAM_ASR_MODELS.split(",")
+    elif idx == recognition.Whisper_CPP:
+        models = constants.WHISPER_CPP_MODELS.split(",")
+    elif idx == recognition.WHISPER_NET:
+        models = constants.WHISPER_NET_MODELS.split(",")
+    elif idx == recognition.QWENASR:
+        models = ["1.7B", "0.6B"]
+    elif idx == recognition.HUGGINGFACE_ASR:
+        models = list(recognition.HUGGINGFACE_ASR_MODELS.keys())
+    elif idx == recognition.FUNASR_CN:
+        models = FUN_ASR_MODELS.split(",")
+    else:
+        models = list(FASTER_MODEL_NAMES)
+        disabled = True
+    models = [m.strip() for m in models if str(m).strip()]
+    return models, disabled
 
 """
 # ---------------------------------------------------------------------------
@@ -860,6 +1014,9 @@ def build_channel_settings():
 
 # 全局 widget 注册表
 _all_widgets = {}
+# Page load restores widgets from disk. Ignore dropdown events until that
+# restore has finished, so the old default cannot be written back over it.
+_advanced_ready = False
 
 
 def _w(key, label, tip="", area=False):
@@ -874,11 +1031,24 @@ def _w(key, label, tip="", area=False):
             options = ComboBox_Data.get(key, [val])
             w = gr.Dropdown(
                 choices=options,
-                value=val if val in options else options[0],
+                value=val if val in options else (options[0] if options else None),
                 label="",
                 interactive=True,
                 show_label=False,
             )
+            if key == "uvr_models":
+                def _save_bgm_model(value):
+                    global _advanced_ready
+                    if not _advanced_ready or not value:
+                        return
+                    chosen = str(value)
+                    if chosen not in options:
+                        return
+                    if str(_load_settings().get("uvr_models", "")) == chosen:
+                        return
+                    _save_settings({"uvr_models": chosen})
+
+                w.change(fn=_save_bgm_model, inputs=[w], outputs=[])
         elif val.lower() in ("true", "false"):
             w = gr.Checkbox(
                 value=val.lower() == "true",
@@ -922,6 +1092,15 @@ def _save_section(section_key, keys):
     save_btn.click(
         fn=_make_handler(keys), inputs=[_all_widgets[k] for k in keys], outputs=[status]
     )
+
+
+def _advanced_form_values():
+    global _advanced_ready
+    current = _load_settings()
+    _user_settings.clear()
+    _user_settings.update(current)
+    _advanced_ready = True
+    return [setting_widget_value(key, current) for key in _all_widgets]
 
 
 # ---------------------------------------------------------------------------
@@ -976,9 +1155,20 @@ def build_ui():
         with gr.Tabs():
             # === Tab 1: 视频翻译 ===
             with gr.Tab(tr("Video Translation"), id="translate"):
-                prev_recogn = gr.State(value=RECOGN_NAMES[DEFAULT_RECOGN])
-                prev_translate = gr.State(value=TRANSLATE_NAMES[DEFAULT_TRANSLATE])
-                prev_tts = gr.State(value=TTS_NAMES[DEFAULT_TTS])
+                _init_recogn = _saved_index("recogn_type", RECOGN_NAMES, DEFAULT_RECOGN)
+                _init_translate = _saved_index(
+                    "translate_type", TRANSLATE_NAMES, DEFAULT_TRANSLATE
+                )
+                _init_tts = _saved_index("tts_type", TTS_NAMES, DEFAULT_TTS)
+                _init_models, _init_models_off = _models_for_recogn(_init_recogn)
+                _init_model = _user_params.get("model_name") or DEFAULT_MODEL
+                if _init_model not in _init_models:
+                    _init_model = (
+                        DEFAULT_MODEL if DEFAULT_MODEL in _init_models else _init_models[0]
+                    )
+                prev_recogn = gr.State(value=RECOGN_NAMES[_init_recogn])
+                prev_translate = gr.State(value=TRANSLATE_NAMES[_init_translate])
+                prev_tts = gr.State(value=TTS_NAMES[_init_tts])
 
                 with gr.Row():
                     with gr.Column(scale=3):
@@ -988,32 +1178,20 @@ def build_ui():
 
                         recogn_choice = gr.Dropdown(
                             choices=RECOGN_NAMES,
-                            value=RECOGN_NAMES[
-                                int(_user_params.get("recogn_type", DEFAULT_RECOGN))
-                                if str(_user_params.get("recogn_type", "")).isdigit()
-                                else DEFAULT_RECOGN
-                            ],
+                            value=RECOGN_NAMES[_init_recogn],
                             label=tr("ASR Channel"),
                             interactive=True,
                         )
                         model_choice = gr.Dropdown(
-                            choices=FASTER_MODEL_NAMES,
-                            value=_user_params.get("model_name", DEFAULT_MODEL),
+                            choices=_init_models,
+                            value=_init_model,
                             label=tr("Model"),
-                            interactive=True,
+                            interactive=not _init_models_off,
                         )
 
                         translate_choice = gr.Dropdown(
                             choices=TRANSLATE_NAMES,
-                            value=TRANSLATE_NAMES[
-                                int(
-                                    _user_params.get(
-                                        "translate_type", DEFAULT_TRANSLATE
-                                    )
-                                )
-                                if str(_user_params.get("translate_type", "")).isdigit()
-                                else DEFAULT_TRANSLATE
-                            ],
+                            value=TRANSLATE_NAMES[_init_translate],
                             label=tr("Translation Channel"),
                             interactive=True,
                         )
@@ -1036,20 +1214,12 @@ def build_ui():
 
                         tts_choice = gr.Dropdown(
                             choices=TTS_NAMES,
-                            value=TTS_NAMES[
-                                int(_user_params.get("tts_type", DEFAULT_TTS))
-                                if str(_user_params.get("tts_type", "")).isdigit()
-                                else DEFAULT_TTS
-                            ],
+                            value=TTS_NAMES[_init_tts],
                             label=tr("TTS Channel"),
                             interactive=True,
                         )
                         # 根据已加载的TTS渠道和目标语言预填充角色列表
-                        _init_tts_idx = (
-                            int(_user_params.get("tts_type", DEFAULT_TTS))
-                            if str(_user_params.get("tts_type", "")).isdigit()
-                            else DEFAULT_TTS
-                        )
+                        _init_tts_idx = _init_tts
                         _init_target = _user_params.get(
                             "target_language", DEFAULT_TARGET_LANG
                         )
@@ -1066,11 +1236,8 @@ def build_ui():
                                 _init_roles = ["No"]
                         except Exception:
                             _init_roles = ["No"]
-                        _saved_role = _user_params.get("voice_role", "No")
-                        _init_role_val = (
-                            _saved_role
-                            if _saved_role in _init_roles
-                            else _init_roles[0]
+                        _init_role_val = _pick_role(
+                            _init_roles, _user_params.get("voice_role", "clone")
                         )
                         voice_role = gr.Dropdown(
                             choices=_init_roles,
@@ -1078,13 +1245,27 @@ def build_ui():
                             label=tr("Voice Role"),
                             interactive=True,
                         )
+                        per_speaker_voice = gr.Checkbox(
+                            label=tr("Each speaker keeps their own voice"),
+                            value=_param_bool("per_speaker_voice", True),
+                            info=tr("Local diarization, then one cloned voice per speaker."),
+                        )
+                        voice_per_sentence = gr.Checkbox(
+                            label=tr("One voice per sentence"),
+                            value=_param_bool("voice_per_sentence", True),
+                            info=tr(
+                                "Each sentence is cloned from its own audio. The same person can change voice from line to line."
+                            ),
+                        )
 
                         with gr.Row():
                             voice_autorate = gr.Checkbox(
-                                label=tr("Audio Speedup"), value=True
+                                label=tr("Audio Speedup"),
+                                value=_param_bool("voice_autorate", False),
                             )
                             video_autorate = gr.Checkbox(
-                                label=tr("Video Slowdown"), value=False
+                                label=tr("Video Slowdown"),
+                                value=_param_bool("video_autorate", False),
                             )
                         with gr.Row():
                             voice_rate = gr.Slider(
@@ -1122,13 +1303,9 @@ def build_ui():
                             )
                         subtitle_type = gr.Dropdown(
                             choices=list(SUBTITLE_TYPES.keys()),
-                            value=list(SUBTITLE_TYPES.keys())[
-                                int(_user_params.get("subtitle_type", 1))
-                                if str(_user_params.get("subtitle_type", "")).isdigit()
-                                   and int(_user_params.get("subtitle_type", 1))
-                                   < len(SUBTITLE_TYPES)
-                                else 1
-                            ],
+                            value=_option_label(
+                                SUBTITLE_TYPES, _param_int("subtitle_type", 0)
+                            ),
                             label=tr("Subtitle Embedding Type"),
                             interactive=True,
                         )
@@ -1137,25 +1314,32 @@ def build_ui():
                         with gr.Accordion(tr("More Settings"), open=False):
                             with gr.Row():
                                 remove_noise = gr.Checkbox(
-                                    label=tr("Noise Reduction"), value=False
+                                    label=tr("Noise Reduction"),
+                                    value=_param_bool("remove_noise", False),
                                 )
                                 fix_punc = gr.Dropdown(
                                     choices=list(PUNC_OPTIONS.keys()),
-                                    value=tr("Default punctuation"),
+                                    value=_option_label(
+                                        PUNC_OPTIONS, _param_int("fix_punc", 0)
+                                    ),
                                     label=tr("Punctuation Processing"),
                                     interactive=True,
                                 )
                             with gr.Row():
                                 is_separate = gr.Checkbox(
-                                    label=tr("Separate Vocals and BGM"), value=False
+                                    label=tr("Separate Vocals and BGM"),
+                                    value=_param_bool("is_separate", True),
                                 )
                                 embed_bgm = gr.Checkbox(
-                                    label=tr("Re-embed Background Audio"), value=True
+                                    label=tr("Re-embed Background Audio"),
+                                    value=_param_bool("embed_bgm", True),
                                 )
                             with gr.Row():
                                 loop_bgm = gr.Dropdown(
                                     choices=list(LOOP_BGM_OPTIONS.keys()),
-                                    value=tr("Truncate background audio"),
+                                    value=_option_label(
+                                        LOOP_BGM_OPTIONS, _param_int("loop_backaudio", 0)
+                                    ),
                                     label=tr("Background Audio Processing"),
                                     interactive=True,
                                 )
@@ -1173,7 +1357,61 @@ def build_ui():
                                 )
 
                         cuda_accel = gr.Checkbox(
-                            label=tr("Enable CUDA Acceleration"), value=False
+                            label=tr("Enable CUDA Acceleration"),
+                            value=_param_bool("is_cuda", True),
+                        )
+                        clear_output = gr.Checkbox(
+                            label=tr("Clear previous output"),
+                            value=_param_bool("clear_cache", False),
+                            info=tr(
+                                "Deletes subtitles and files from the last run of this video. Leave it off to keep them."
+                            ),
+                        )
+                        speaker_ref_threads = gr.Slider(
+                            minimum=0,
+                            maximum=16,
+                            value=int(_user_params.get("speaker_ref_threads", 0) or 0),
+                            step=1,
+                            label=tr("Speaker reference threads"),
+                            info=tr(
+                                "0 follows the CPU, up to 8 threads. A higher number overrides that."
+                            ),
+                        )
+                        speaker_cap = gr.Slider(
+                            minimum=0,
+                            maximum=30,
+                            value=int(_user_params.get("speaker_cap", 8) or 0),
+                            step=1,
+                            label=tr("Maximum speakers"),
+                            info=tr(
+                                "0 means no limit. 8 keeps the film to at most 8 voices."
+                            ),
+                        )
+                        test_minutes = gr.Slider(
+                            minimum=0,
+                            maximum=60,
+                            value=int(_user_params.get("test_minutes", 0) or 0),
+                            step=1,
+                            label=tr("Test length in minutes"),
+                            info=tr(
+                                "0 uses the whole film. 10 runs only the first 10 minutes."
+                            ),
+                        )
+                        with gr.Row():
+                            spoken_srt = gr.File(
+                                label=tr("Import spoken SRT"),
+                                file_types=[".srt"],
+                                type="filepath",
+                            )
+                            target_srt = gr.File(
+                                label=tr("Import target language SRT"),
+                                file_types=[".srt"],
+                                type="filepath",
+                            )
+                        gr.Markdown(
+                            tr(
+                                "A spoken file skips speech recognition. A target file skips translation. The two files need the same number of lines."
+                            )
                         )
                         channel_warning = gr.Markdown("", visible=False)
 
@@ -1193,7 +1431,7 @@ def build_ui():
                         )
 
                 # 渠道验证并更新模型列表
-                def validate_recogn(choice, prev):
+                def validate_recogn(choice, prev, current_model):
                     idx = _recogn_index_from_display(choice)
 
                     _rs = recognition.is_input_api(recogn_type=idx, return_str=True)
@@ -1203,32 +1441,16 @@ def build_ui():
                         return prev, f"⚠️ {msg}", gr.update()
 
                     # 根据渠道更新模型下拉框
-                    models = []
-                    disabled = False
                     print(f'{idx=}')
-                    print(f'{recognition.Whisper_CPP=}')
-                    if idx in [recognition.FASTER_WHISPER, recognition.Faster_Whisper_XXL, recognition.WHISPERX_API]:
-                        models = constants.WHISPER_MODELS.split(',')
-                    elif idx == recognition.OPENAI_WHISPER:
-                        models = OPENAI_WHISPER_MODELS.split(',')
-                    elif idx == recognition.Deepgram:
-                        models = DEEPGRAM_ASR_MODELS
-                    elif idx == recognition.Whisper_CPP:
-                        models = constants.WHISPER_CPP_MODELS.split(',')
-                    elif idx == recognition.WHISPER_NET:
-                        models = constants.WHISPER_NET_MODELS.split(',')
-                    elif idx == recognition.QWENASR:
-                        models = ["1.7B", "0.6B"]
-                    elif idx == recognition.HUGGINGFACE_ASR:
-                        models = list(recognition.HUGGINGFACE_ASR_MODELS.keys())
-                    elif idx == recognition.FUNASR_CN:
-                        models = FUN_ASR_MODELS
-                    else:
-                        models = FASTER_MODEL_NAMES
-                        disabled = True
+                    models, disabled = _models_for_recogn(idx)
 
                     if models:
-                        default_val = models[0] if models else ""
+                        if current_model in models:
+                            default_val = current_model
+                        elif DEFAULT_MODEL in models:
+                            default_val = DEFAULT_MODEL
+                        else:
+                            default_val = models[0]
                         return (
                             choice,
                             "",
@@ -1251,7 +1473,7 @@ def build_ui():
                         return prev, f"⚠️ {msg}"
                     return choice, ""
 
-                def tts_change_handler(choice, prev, target_display):
+                def tts_change_handler(choice, prev, target_display, current_role):
                     idx = _tts_index_from_display(choice)
                     warning = ""
                     _rs = tts.is_input_api(tts_type=idx, return_str=True)
@@ -1270,13 +1492,13 @@ def build_ui():
                         roles = ["No"]
                     return (
                         choice,
-                        gr.update(choices=roles, value=roles[0] if roles else "No"),
+                        gr.update(choices=roles, value=_pick_role(roles, current_role)),
                         warning,
                     )
 
                 recogn_choice.change(
                     fn=validate_recogn,
-                    inputs=[recogn_choice, prev_recogn],
+                    inputs=[recogn_choice, prev_recogn, model_choice],
                     outputs=[recogn_choice, channel_warning, model_choice],
                 )
                 translate_choice.change(
@@ -1286,11 +1508,11 @@ def build_ui():
                 )
                 tts_choice.change(
                     fn=tts_change_handler,
-                    inputs=[tts_choice, prev_tts, target_lang],
+                    inputs=[tts_choice, prev_tts, target_lang, voice_role],
                     outputs=[tts_choice, voice_role, channel_warning],
                 )
 
-                def update_voice_roles(tts_display, target_display):
+                def update_voice_roles(tts_display, target_display, current_role):
                     tts_idx = _tts_index_from_display(tts_display)
                     lang_code = _lang_code_from_display(target_display)
                     try:
@@ -1299,11 +1521,11 @@ def build_ui():
                             roles = ["No"]
                     except Exception:
                         roles = ["No"]
-                    return gr.update(choices=roles, value=roles[0] if roles else "No")
+                    return gr.update(choices=roles, value=_pick_role(roles, current_role))
 
                 target_lang.change(
                     fn=update_voice_roles,
-                    inputs=[tts_choice, target_lang],
+                    inputs=[tts_choice, target_lang, voice_role],
                     outputs=[voice_role],
                 )
 
@@ -1333,6 +1555,14 @@ def build_ui():
                         loop_bgm_name,
                         backaudio_volume_val,
                         cuda_val,
+                        per_speaker_val,
+                        voice_per_sentence_val,
+                        clear_output_val,
+                        speaker_ref_threads_val,
+                        speaker_cap_val,
+                        test_minutes_val,
+                        spoken_srt_file,
+                        target_srt_file,
                 ):
                     print(f"{file_path=}")
                     if not file_path:
@@ -1345,23 +1575,80 @@ def build_ui():
                     log_lines = []
 
                     def log(msg):
-                        log_lines.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-                        return "\n".join(log_lines)
+                        return _append_exec_log(log_lines, msg, time.strftime("%H:%M:%S"))
 
                     recogn_idx = _recogn_index_from_display(recogn_display)
                     translate_idx = _translate_index_from_display(translate_display)
                     tts_idx = _tts_index_from_display(tts_display)
+                    saved_role = voice_role_name
+                    per_speaker = bool(per_speaker_val)
+                    local_clone = set(tts.SUPPORT_CLONE) & set(tts.LOCAL_BUILTIN)
+                    switched_tts = False
+                    if per_speaker and tts_idx not in local_clone:
+                        tts_idx = tts.CHATTERBOX_TTS
+                        switched_tts = True
+                    if per_speaker:
+                        voice_role_name = "clone"
                     source_code = _lang_code_from_display(source_display)
                     target_code = _lang_code_from_display(target_display)
-                    subtitle_val = SUBTITLE_TYPES.get(subtitle_type_name, 1)
+                    subtitle_val = SUBTITLE_TYPES.get(subtitle_type_name, 0)
                     fix_punc_val = PUNC_OPTIONS.get(fix_punc_name, 0)
                     loop_bgm_val = LOOP_BGM_OPTIONS.get(loop_bgm_name, 0)
+                    try:
+                        _save_params({
+                            "recogn_type": recogn_idx,
+                            "model_name": model_name,
+                            "translate_type": translate_idx,
+                            "source_language": source_code,
+                            "target_language": target_code,
+                            "tts_type": _tts_index_from_display(tts_display),
+                            "voice_role": saved_role,
+                            "per_speaker_voice": per_speaker,
+                            "voice_per_sentence": bool(voice_per_sentence_val),
+                            "voice_autorate": bool(voice_autorate_val),
+                            "video_autorate": bool(video_autorate_val),
+                            "voice_rate": _format_rate(int(voice_rate_val)),
+                            "volume": _format_rate(int(volume_rate_val)),
+                            "pitch": _format_pitch(int(pitch_rate_val)),
+                            "subtitle_type": subtitle_val,
+                            "remove_noise": bool(remove_noise_val),
+                            "fix_punc": fix_punc_val,
+                            "is_separate": bool(is_separate_val),
+                            "embed_bgm": bool(embed_bgm_val),
+                            "loop_backaudio": loop_bgm_val,
+                            "backaudio_volume": float(backaudio_volume_val),
+                            "is_cuda": bool(cuda_val),
+                            "clear_cache": bool(clear_output_val),
+                            "speaker_ref_threads": int(speaker_ref_threads_val or 0),
+                            "speaker_cap": int(speaker_cap_val or 0),
+                            "test_minutes": int(test_minutes_val or 0),
+                        })
+                    except Exception:
+                        traceback.print_exc()
 
                     try:
                         app_cfg.exit_soft = False
                         app_cfg.exec_mode = "cli"
 
                         getset_gpu()
+                        test_minutes_int = int(test_minutes_val or 0)
+                        if test_minutes_int > 0:
+                            clip_dir = Path(TEMP_DIR) / "test-clips"
+                            clip_dir.mkdir(parents=True, exist_ok=True)
+                            clip_path = test_clip_target(file_path, clip_dir, test_minutes_int)
+                            source_path = Path(file_path)
+                            if (
+                                not clip_path.is_file()
+                                or clip_path.stat().st_mtime < source_path.stat().st_mtime
+                            ):
+                                runffmpeg(test_clip_args(source_path, clip_path, test_minutes_int))
+                            file_path = clip_path.as_posix()
+                            yield (
+                                log(tr("Testing the first {} minutes.", test_minutes_int)),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
                         _file_obj = tools.format_video(
                             Path(file_path).absolute().as_posix()
                         )
@@ -1373,12 +1660,6 @@ def build_ui():
                         _target_dir = f"{ROOT_DIR}/output/{_nospacebasename}"
                         _file_obj["target_dir"] = _target_dir
                         Path(_cache_folder).mkdir(parents=True, exist_ok=True)
-                        target_path = Path(_target_dir)
-                        if target_path.exists():
-                            for f in sorted(target_path.rglob("*")):
-                                if f.is_file():
-                                    if f.suffix.lower() in [".mp4", ".mkv"]:
-                                        f.unlink(missing_ok=True)
                         Path(_target_dir).mkdir(parents=True, exist_ok=True)
 
                         from dataclasses import asdict
@@ -1402,8 +1683,8 @@ def build_ui():
                             "model_name": model_name,
                             "is_cuda": cuda_val,
                             "remove_noise": remove_noise_val,
-                            "enable_diariz": False,
-                            "nums_diariz": -1,
+                            "enable_diariz": per_speaker,
+                            "nums_diariz": speaker_cap_to_nums(speaker_cap_val) if per_speaker else 0,
                             "detect_language": source_code,
                             "rephrase": 0,
                             "fix_punc": fix_punc_val,
@@ -1415,11 +1696,12 @@ def build_ui():
                             "voice_autorate": voice_autorate_val,
                             "video_autorate": video_autorate_val,
                             "align_sub_audio": True,
+                            "voice_per_sentence": bool(voice_per_sentence_val),
                             "translate_type": translate_idx,
                             "is_separate": is_separate_val,
                             "recogn2pass": False,
                             "subtitle_type": subtitle_val,
-                            "clear_cache": True,
+                            "clear_cache": bool(clear_output_val),
                             "embed_bgm": embed_bgm_val,
                             "loop_backaudio": loop_bgm_val,
                             "backaudio_volume": backaudio_volume_val,
@@ -1453,6 +1735,13 @@ def build_ui():
                             [],
                             _BTN_RUNNING,
                         )
+                        if bool(voice_per_sentence_val):
+                            yield (
+                                log(tr("Each sentence keeps its own cloned voice.")),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
                         yield log(""), None, [], _BTN_RUNNING
 
                         yield log(tr("Starting video translation...")), None, [], _BTN_RUNNING
@@ -1460,6 +1749,102 @@ def build_ui():
                         from videotrans.task.taskcfg import TaskCfgVTT
 
                         trk = TransCreate(cfg=TaskCfgVTT(**params_dict))
+                        trk.do_diarize = per_speaker
+                        if bool(clear_output_val):
+                            yield (
+                                log(tr("Previous output and cache were deleted.")),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
+                        from videotrans.task._import_srt import install_subtitle_files
+                        from videotrans.task._reference_srt import load_reference_uploads
+
+                        reference_pairs = load_reference_uploads(spoken_srt_file, target_srt_file)
+                        if reference_pairs is not None:
+                            trk.reference_pairs = reference_pairs
+                            Path(trk.cfg.target_sub).unlink(missing_ok=True)
+                            yield (
+                                log(
+                                    tr(
+                                        "The uploaded subtitles are a reference for the translator, {} lines.",
+                                        len(reference_pairs),
+                                    )
+                                ),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
+                            imported = {"spoken": None, "target": None}
+                        else:
+                            try:
+                                imported = install_subtitle_files(
+                                    spoken_srt_file,
+                                    target_srt_file,
+                                    trk.cfg.source_sub,
+                                    trk.cfg.target_sub,
+                                    limit_ms=test_minutes_int * 60 * 1000 if test_minutes_int > 0 else None,
+                                    drop_paths=(
+                                        f"{_target_dir}/speaker.json",
+                                        f"{_cache_folder}/speaker.json",
+                                        f"{_target_dir}/words.json",
+                                        f"{_cache_folder}/words.json",
+                                    ),
+                                )
+                            except ValueError as exc:
+                                yield (
+                                    log(tr("The subtitle file has no lines inside this run: {}", exc)),
+                                    None,
+                                    [],
+                                    _BTN_IDLE,
+                                )
+                                return
+                        if imported["spoken"] is not None or imported["target"] is not None:
+                            trk.force_new_dubbing = True
+                            yield (
+                                log(tr("The selected subtitles are used, and the voices are generated again.")),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
+                        if imported["spoken"] is not None:
+                            trk.keep_imported_lines = True
+                            yield (
+                                log(tr("Using the uploaded spoken subtitles, {} lines.", imported["spoken"])),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
+                        if imported["target"] is not None:
+                            yield (
+                                log(tr("Using the uploaded target subtitles, {} lines.", imported["target"])),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
+                        if (
+                            imported["spoken"] is not None
+                            and imported["target"] is not None
+                            and imported["spoken"] != imported["target"]
+                        ):
+                            yield (
+                                log(
+                                    tr(
+                                        "The spoken file has {} lines and the target file has {} lines.",
+                                        imported["spoken"],
+                                        imported["target"],
+                                    )
+                                ),
+                                None,
+                                [],
+                                _BTN_RUNNING,
+                            )
+                        app_cfg.line_roles = {}
+                        if per_speaker:
+                            note = tr("Per-speaker voice: local diarization, then one cloned voice per speaker.")
+                            if switched_tts:
+                                note += " " + tr("This TTS cannot clone locally, so this run uses Chatterbox.")
+                            yield log(note), None, [], _BTN_RUNNING
 
                         stages = [
                             (tr("Stage 1/8: Preprocessing..."), "prepare", tr("Preprocessing completed")),
@@ -1487,9 +1872,48 @@ def build_ui():
                                 tr("Final assembly completed"),
                             ),
                         ]
+                        app_cfg.web_log_queue = queue.Queue()
+
+                        def _drain_web_log():
+                            while True:
+                                try:
+                                    text = app_cfg.web_log_queue.get_nowait()
+                                except queue.Empty:
+                                    return
+                                yield text
+
+                        def _run_stage(method_name):
+                            error = []
+
+                            def work():
+                                try:
+                                    getattr(trk, method_name)()
+                                except Exception as exc:
+                                    error.append(exc)
+
+                            thread = threading.Thread(target=work, daemon=True)
+                            thread.start()
+                            try:
+                                while thread.is_alive():
+                                    for text in _drain_web_log():
+                                        yield log(text), None, [], _BTN_RUNNING
+                                    thread.join(0.4)
+                            finally:
+                                # Closing the page raises GeneratorExit at the yield.
+                                # Wait for this stage so a second click cannot start
+                                # another pipeline while the first one is still running.
+                                thread.join()
+                            for text in _drain_web_log():
+                                yield log(text), None, [], _BTN_RUNNING
+                            if error:
+                                exc = error[0]
+                                raise exc.with_traceback(exc.__traceback__)
+
                         for stage_name, method, done_msg in stages:
                             yield log(stage_name), None, [], _BTN_RUNNING
-                            getattr(trk, method)()
+                            yield from _run_stage(method)
+                            if method == "diariz" and per_speaker:
+                                yield log(_speaker_summary(_cache_folder, _target_dir)), None, [], _BTN_RUNNING
                             if method != "assembling":
                                 yield log(f"✓ {done_msg}"), None, [], _BTN_RUNNING
 
@@ -1551,6 +1975,8 @@ def build_ui():
                             [],
                             _BTN_IDLE,
                         )
+                    finally:
+                        app_cfg.web_log_queue = None
 
                 start_btn.click(
                     fn=run_translation,
@@ -1576,8 +2002,124 @@ def build_ui():
                         loop_bgm,
                         backaudio_volume,
                         cuda_accel,
+                        per_speaker_voice,
+                        voice_per_sentence,
+                        clear_output,
+                        speaker_ref_threads,
+                        speaker_cap,
+                        test_minutes,
+                        spoken_srt,
+                        target_srt,
                     ],
                     outputs=[log_output, video_preview, result_files, start_btn],
+                )
+
+                def _restore_saved_form():
+                    fresh = _load_params()
+                    if isinstance(fresh, dict) and fresh:
+                        _user_params.clear()
+                        _user_params.update(fresh)
+                    recogn_idx = _saved_index("recogn_type", RECOGN_NAMES, DEFAULT_RECOGN)
+                    translate_idx = _saved_index(
+                        "translate_type", TRANSLATE_NAMES, DEFAULT_TRANSLATE
+                    )
+                    tts_idx = _saved_index("tts_type", TTS_NAMES, DEFAULT_TTS)
+                    models, models_off = _models_for_recogn(recogn_idx)
+                    saved_model = _user_params.get("model_name") or DEFAULT_MODEL
+                    if saved_model not in models:
+                        saved_model = (
+                            DEFAULT_MODEL if DEFAULT_MODEL in models else (models[0] if models else None)
+                        )
+                    source_code = _lang_code_from_display(
+                        _user_params.get("source_language", DEFAULT_SOURCE_LANG)
+                    )
+                    target_raw = _user_params.get("target_language", DEFAULT_TARGET_LANG)
+                    target_code = (
+                        _lang_code_from_display(target_raw)
+                        if target_raw not in (None, "", "-")
+                        else "-"
+                    )
+                    try:
+                        roles = role_menu(
+                            tts_idx,
+                            langcode=target_code if target_code not in (None, "", "-") else None,
+                        ) or ["No"]
+                    except Exception:
+                        roles = ["No"]
+                    role_val = _pick_role(roles, _user_params.get("voice_role", "clone"))
+                    try:
+                        back_vol = float(_user_params.get("backaudio_volume", 0.6))
+                    except (TypeError, ValueError):
+                        back_vol = 0.6
+                    return (
+                        RECOGN_NAMES[recogn_idx],
+                        gr.update(
+                            choices=models,
+                            value=saved_model,
+                            interactive=not models_off,
+                        ),
+                        TRANSLATE_NAMES[translate_idx],
+                        source_code,
+                        target_code,
+                        TTS_NAMES[tts_idx],
+                        gr.update(choices=roles, value=role_val),
+                        _param_bool("voice_autorate", False),
+                        _param_bool("video_autorate", False),
+                        _percent_int("voice_rate", 0),
+                        _percent_int("volume", 0),
+                        _percent_int("pitch", 0),
+                        _option_label(SUBTITLE_TYPES, _param_int("subtitle_type", 0)),
+                        _param_bool("remove_noise", False),
+                        _option_label(PUNC_OPTIONS, _param_int("fix_punc", 0)),
+                        _param_bool("is_separate", True),
+                        _param_bool("embed_bgm", True),
+                        _option_label(LOOP_BGM_OPTIONS, _param_int("loop_backaudio", 0)),
+                        back_vol,
+                        _param_bool("is_cuda", True),
+                        _param_bool("per_speaker_voice", True),
+                        _param_bool("voice_per_sentence", True),
+                        _param_bool("clear_cache", False),
+                        int(_user_params.get("speaker_ref_threads", 0) or 0),
+                        int(_user_params.get("speaker_cap", 8) or 0),
+                        int(_user_params.get("test_minutes", 0) or 0),
+                        RECOGN_NAMES[recogn_idx],
+                        TRANSLATE_NAMES[translate_idx],
+                        TTS_NAMES[tts_idx],
+                    )
+
+                app.load(
+                    fn=_restore_saved_form,
+                    outputs=[
+                        recogn_choice,
+                        model_choice,
+                        translate_choice,
+                        source_lang,
+                        target_lang,
+                        tts_choice,
+                        voice_role,
+                        voice_autorate,
+                        video_autorate,
+                        voice_rate,
+                        volume_rate,
+                        pitch_rate,
+                        subtitle_type,
+                        remove_noise,
+                        fix_punc,
+                        is_separate,
+                        embed_bgm,
+                        loop_bgm,
+                        backaudio_volume,
+                        cuda_accel,
+                        per_speaker_voice,
+                        voice_per_sentence,
+                        clear_output,
+                        speaker_ref_threads,
+                        speaker_cap,
+                        test_minutes,
+                        prev_recogn,
+                        prev_translate,
+                        prev_tts,
+                    ],
                 )
 
             # === Tab 2: 渠道设置 ===
@@ -1587,6 +2129,11 @@ def build_ui():
             # === Tab 3: 高级选项 ===
             with gr.Tab(tr("Advanced Options"), id="advanced"):
                 build_advanced_settings()
+                if _all_widgets:
+                    app.load(
+                        fn=_advanced_form_values,
+                        outputs=list(_all_widgets.values()),
+                    )
 
     return app
 
@@ -1609,6 +2156,8 @@ if __name__ == "__main__":
             server_port=args.port,
             share=args.share,
             inbrowser=True,
+            # /app/output is a symlink to the mounted /data volume.
+            allowed_paths=[str(ROOT_DIR), "/data", "/tmp"],
             theme=gr.themes.Soft(),
             css="""
         *, *::before, *::after {

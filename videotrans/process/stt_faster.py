@@ -49,6 +49,7 @@ def faster_whisper(
     if device == 'auto':
         device="cuda" if is_cuda else 'cpu'
     def _create_model(_compute_type):
+        nonlocal device, is_cuda
         try:
             logger.debug(f'[faster_whisper]加载模型{model_name}: running on {device},{_compute_type=}')
             model = WhisperModel(
@@ -58,6 +59,12 @@ def faster_whisper(
             )
             return model
         except Exception as e:
+            # CTranslate2 CUDA is NVIDIA-only. On ROCm this error is fatal unless we drop to CPU.
+            if device == "cuda" and "CUDA" in str(e):
+                logger.warning(f'faster-whisper CUDA unavailable, falling back to CPU: {e}')
+                device = "cpu"
+                is_cuda = False
+                return _create_model("int8")
             if 'Unable to open file' in str(e) or _compute_type == 'float32':
                 raise
             # 对数据类型问题引发的错误重试

@@ -1,4 +1,6 @@
-import multiprocessing, os
+import multiprocessing
+import os
+import threading
 import time
 
 from videotrans.configure.config import app_cfg, settings, logger
@@ -26,62 +28,61 @@ def pool_init_worker():
             setattr(sys, _stream, _null_writer)
 
 
-def _task_worker_wrapper(func, kwargs):
+def _task_worker_entry(func, kwargs, result_q):
+    pool_init_worker()
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-    # 这里执行真正的任务
-    return func(**kwargs)
+    try:
+        result_q.put(("ok", func(**kwargs)))
+    except Exception as e:
+        result_q.put(("err", f"{type(e).__name__}: {e}"))
 
 
-class AsyncResultFutureWrapper:
-    def __init__(self, async_result, pool_executor):
-        self.async_result = async_result
-        self._pool = pool_executor  # 持有对进程池的引用，用于检查健康状态
+class OneShotFuture:
+    """One process per task. The result queue is read while the child is alive.
 
-    def result(self, timeout=None):
-        # 默认总超时 1 小时，或者自定义
-        start_time = time.time()
-        actual_timeout = timeout if timeout is not None else 3600
+    A 2-hour transcript is larger than the pipe buffer. Waiting for the child
+    to exit before reading left both sides blocked.
+    """
 
-        while True:
-            # 1. 检查是否已经完成（正常结束或捕获了 Python 异常）
-            if self.async_result.ready():
-                try:
-                    return self.async_result.get(timeout=1)
-                except Exception as e:
-                    return None, f"Subprocess Error: {str(e)}"
-
-            # 2. 检查进程池是否还健康
-            # 如果进程池里所有的工作进程都消失了，或者池被关闭了
-            if not self._is_pool_healthy():
-                return None, "Subprocess crashed hard (Segmentation Fault/OOM)"
-
-            # 3. 检查是否超时
-            if (time.time() - start_time) > actual_timeout:
-                return None, "Task timeout (Possible deadlock in C++ layer)"
-
-            # 4. 检查外部退出信号
-            if app_cfg.exit_soft:
-                return None, "Task interrupted by user"
-
-            # 5. 短暂休眠，防止 CPU 空转
-            time.sleep(0.5)
-
-    def _is_pool_healthy(self):
-        """检查进程池中的工作进程是否还在存活"""
-        try:
-            # Pool 的私有属性 _pool 包含了所有工作进程对象 (Process)
-            # 虽然访问私有属性略有风险，但在 Python 3.10 中这是检测 Pool 健康最直接的方法
-            workers = getattr(self._pool, '_pool', [])
-            if not workers:
-                return False
-            # 只要有一个工作进程是存活的，就认为池还在工作
-            return any(w.is_alive() for w in workers)
-        except:
-            return False
+    def __init__(self, proc, result_q):
+        self.proc = proc
+        self.result_q = result_q
+        self._cached = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._collect_bg, daemon=True)
+        self._thread.start()
 
     def done(self):
-        return self.async_result.ready()
+        if self.proc.is_alive():
+            return False
+        self._ready.wait(timeout=5)
+        return True
+
+    def result(self, timeout=None):
+        self._ready.wait(None if timeout is None else timeout)
+        if self._cached is None:
+            return None, "Subprocess crashed hard (Segmentation Fault/OOM)"
+        return self._cached
+
+    def _collect_bg(self):
+        kind, payload = "dead", None
+        try:
+            kind, payload = self.result_q.get()
+        except Exception:
+            kind, payload = "dead", None
+        self.proc.join(timeout=30)
+        try:
+            self.result_q.close()
+        except Exception:
+            pass
+        if kind == "ok":
+            self._cached = payload
+        elif kind == "err":
+            self._cached = (None, f"Subprocess Error: {payload}")
+        else:
+            self._cached = (None, "Subprocess crashed hard (Segmentation Fault/OOM)")
+        self._ready.set()
 
 
 # ==========================================
@@ -106,56 +107,20 @@ class GlobalProcessManager:
 
 
     @classmethod
-    def get_executor_cpu(cls):
-        if cls._executor_cpu is None:
-            ctx = multiprocessing.get_context('spawn')
-            max_workers = app_cfg.MAX_CPU_PROCESS
-            logger.debug(f'CPU进程池:{max_workers=}')
-            cls._executor_cpu = ctx.Pool(
-                processes=int(max_workers),
-                initializer=pool_init_worker, 
-                maxtasksperchild=1  # <--- CPU 也让它跑完就死，彻底释放物理内存
-            )
-        return cls._executor_cpu
-
-    @classmethod
-    def get_executor_gpu(cls):
-        """
-        max_workers 设为 1，意味着同一时间只能跑一个 AI 任务。
-        """
-        if cls._executor_gpu is None:
-            ctx = multiprocessing.get_context('spawn')
-            max_workers = app_cfg.MAX_GPU_PROCESS
-            logger.debug(f'GPU进程池:{max_workers=}')
-            cls._executor_gpu = ctx.Pool(
-                processes=int(max_workers),
-                initializer=pool_init_worker, 
-                maxtasksperchild=1
-            )
-
-        return cls._executor_gpu
+    def _submit(cls, func, kwargs):
+        ctx = multiprocessing.get_context("spawn")
+        result_q = ctx.Queue()
+        proc = ctx.Process(target=_task_worker_entry, args=(func, kwargs, result_q))
+        proc.start()
+        return OneShotFuture(proc, result_q)
 
     @classmethod
     def submit_task_cpu(cls, func, **kwargs):
-        _executor = cls.get_executor_cpu()
-        # 使用 error_callback 记录错误日志
-        async_result = _executor.apply_async(
-            _task_worker_wrapper,
-            args=(func, kwargs),
-            error_callback=lambda e: logger.error(f"CPU进程池回调异常: {e}")
-        )
-        return AsyncResultFutureWrapper(async_result, _executor)
+        return cls._submit(func, kwargs)
 
     @classmethod
     def submit_task_gpu(cls, func, **kwargs):
-        _executor = cls.get_executor_gpu()
-        async_result = _executor.apply_async(
-            _task_worker_wrapper,
-            args=(func, kwargs),
-            error_callback=lambda e: logger.error(f"GPU进程池回调异常: {e}")
-        )
-
-        return AsyncResultFutureWrapper(async_result, _executor)
+        return cls._submit(func, kwargs)
 
     @classmethod
     def shutdown(cls):

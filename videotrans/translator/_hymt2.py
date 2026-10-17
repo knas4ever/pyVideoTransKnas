@@ -77,5 +77,9 @@ class HYMT2(BaseTrans):
         try:
             hy.hymt2_model=None
             hy.hymt2_tokenizer=None
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except BaseException:
             pass

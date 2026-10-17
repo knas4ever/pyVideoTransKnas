@@ -56,7 +56,7 @@ notices = {
     'common': ['lang', 'countdown_sec', 'homedir', 'retry_nums', 'llm_chunk_size', 'llm_ai_type', 'dont_notify',
                'noise_separate_nums', 'uvr_models', 'batch_nums', 'show_more_settings', 'process_max',
                'process_max_gpu', 'device_name', 'bit8'],
-    'video': ['crf', 'preset', 'video_codec', 'out_video_ext', 'fps_mode', 'force_lib', 'hw_decode', 'ffmpeg_cmd'],
+    'video': ['crf', 'preset', 'video_codec', 'mux_audio', 'out_video_ext', 'fps_mode', 'force_lib', 'hw_decode', 'ffmpeg_cmd'],
     'whisper': ['vad_type', 'threshold', 'no_speech_threshold', 'max_speech_duration_s', 'min_speech_duration_ms',
                 'min_silence_duration_ms', 'model_for_recogn2', 'max_speech_duration_s2', 'min_speech_duration_ms2',
                 'speaker_type', 'hf_token', 'cuda_com_type', 'beam_size', 'best_of', 'condition_on_previous_text',

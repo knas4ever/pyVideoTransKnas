@@ -39,7 +39,23 @@ def _load_catalog(locale):
     return data if isinstance(data, dict) else {}
 
 
-WEBUI_LOCALE = normalize_locale(os.environ.get("PYVIDEOTRANS_LANG", "zh_CN"))
+def _startup_locale():
+    """Honor PYVIDEOTRANS_LANG, then the saved UI language, then Chinese."""
+    env_lang = os.environ.get("PYVIDEOTRANS_LANG")
+    if env_lang:
+        return normalize_locale(env_lang)
+    try:
+        cfg_path = Path(__file__).resolve().parents[1] / "videotrans" / "cfg.json"
+        if cfg_path.is_file():
+            saved = json.loads(cfg_path.read_text(encoding="utf-8")).get("lang") or ""
+            if saved:
+                return normalize_locale(saved)
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return "zh_CN"
+
+
+WEBUI_LOCALE = _startup_locale()
 _CATALOG = _load_catalog(WEBUI_LOCALE)
 
 

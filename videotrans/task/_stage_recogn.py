@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 
-from videotrans.configure.config import tr, ROOT_DIR, settings, logger
+from videotrans.configure.config import tr, ROOT_DIR, settings, logger, params
 from videotrans.configure.constants import DENOISE_URL_MS, PUNC_RESTORE_MS, DENOISE_URL_HF, PUNC_RESTORE_HF
 from videotrans.configure.excepts import SpeechToTextError
 from videotrans.recognition import run as run_recogn,  FASTER_WHISPER
@@ -24,9 +24,11 @@ class RecognMixin:
         self.precent += 3
         self.signal(text=tr("kaishishibie"))
         if vail_file(self.cfg.source_sub):
+            logger.debug(f'复用已存在的原始字幕，跳过识别: {self.cfg.source_sub}')
             self.source_srt_list = get_subtitle_from_srt(self.cfg.source_sub, is_file=True)
-            if Path(self.cfg.target_dir + "/speaker.json").exists():
-                shutil.copy2(self.cfg.target_dir + "/speaker.json", self.cfg.cache_folder + "/speaker.json")
+            saved_speakers = Path(self.cfg.target_dir + "/speaker.json")
+            if saved_speakers.exists() and not self.cfg.clear_cache:
+                shutil.copy2(saved_speakers, self.cfg.cache_folder + "/speaker.json")
             self._recogn_succeed()
             return
 
@@ -214,13 +216,28 @@ class RecognMixin:
                 logger.exception(f'克隆语音前分离出 44.1k 的原始音频失败',exc_info=True)
 
         logger.debug(f'语音克隆模式下，所用参考音频为:{vocal}')
+        per_sentence = bool(getattr(self.cfg, "voice_per_sentence", False))
+        if per_sentence:
+            logger.debug("Hver sætning klones fra sin egen lyd")
+            shared_refs = set()
+        else:
+            shared_refs = self._assign_speaker_reference_wavs(vocal)
+        from videotrans.task._speaker_refs import clone_span_ms
+        from videotrans.util.help_srt import ms_to_time_string
+
         def _cutaudio_from_vocal(it):
             try:
-                logger.debug(f"裁切对应片段为参考音频：{it['startraw']}->{it['endraw']}\n当前{it=}")
+                span = clone_span_ms(it, per_sentence=per_sentence)
+                if span is None:
+                    ss, to = it["startraw"], it["endraw"]
+                else:
+                    ss = ms_to_time_string(ms=span[0])
+                    to = ms_to_time_string(ms=span[1])
+                logger.debug(f"裁切对应片段为参考音频：{ss}->{to}\n当前{it=}")
                 cut_from_audio(
                     audio_file=vocal,
-                    ss=it['startraw'],
-                    to=it['endraw'],
+                    ss=ss,
+                    to=to,
                     out_file=it['ref_wav']
                 )
             except Exception as e:
@@ -229,7 +246,101 @@ class RecognMixin:
         all_task = []
         with ThreadPoolExecutor(max_workers=min(8, len(self.queue_tts), os.cpu_count())) as pool:
             for item in self.queue_tts:
-                if item.get('ref_wav'):
+                if item.get('ref_wav') and item['ref_wav'] not in shared_refs:
                     all_task.append(pool.submit(_cutaudio_from_vocal, item))
             if len(all_task) > 0:
                 _ = [i.result() for i in all_task]
+
+    def _load_speaker_ids(self):
+        for folder in (self.cfg.cache_folder, self.cfg.target_dir):
+            path = Path(folder) / "speaker.json"
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, list) and data:
+                return [str(item) if item else "" for item in data]
+        return []
+
+    def _assign_speaker_reference_wavs(self, vocal):
+        """One reference clip per detected speaker. Returns the written paths."""
+        loaded = self._load_speaker_ids()
+        speakers = []
+        for index, it in enumerate(self.queue_tts):
+            # The dubbing queue stores the speaker matched by time. The file is
+            # still ordered like the source cues, so an index into it shifts
+            # after a merged translation line.
+            speaker = it.get("speaker")
+            if speaker:
+                speakers.append(str(speaker))
+            elif index < len(loaded):
+                speakers.append(loaded[index])
+            else:
+                speakers.append("")
+        if len(set(speakers)) < 2 or not vocal or not Path(vocal).exists():
+            return set()
+        from videotrans.task._speaker_refs import (
+            line_uses_own_voice,
+            plan_speaker_reference_spans,
+        )
+        from videotrans.util.help_srt import ms_to_time_string
+
+        spans = []
+        for it in self.queue_tts:
+            if not it.get("ref_wav"):
+                spans.append((0, 0))
+                continue
+            start = int(it.get("start_time_source") or it.get("start_time") or 0)
+            end = int(it.get("end_time_source") or it.get("end_time") or 0)
+            spans.append((start, end))
+        plan = plan_speaker_reference_spans(spans, speakers)
+        if not plan:
+            return set()
+        from videotrans.task._speaker_refs import reference_cut_workers, write_speaker_reference
+
+        workers = reference_cut_workers(
+            len(plan), os.cpu_count(), params.get("speaker_ref_threads", 0)
+        )
+        logger.debug(f'并行裁切说话人参考音频: {len(plan)} 人, {workers} 线程')
+
+        def _concat(list_file, ref_path):
+            return runffmpeg(
+                ["-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", ref_path]
+            )
+
+        def _one(item):
+            spk, pieces = item
+            try:
+                ref_path = write_speaker_reference(
+                    speaker=spk,
+                    pieces=pieces,
+                    cache_folder=self.cfg.cache_folder,
+                    vocal=vocal,
+                    cut=cut_from_audio,
+                    concat=_concat,
+                    to_time=lambda ms: ms_to_time_string(ms=ms),
+                )
+            except Exception as e:
+                logger.exception(f'按说话人裁切参考音频失败:{spk},{e}', exc_info=True)
+                return spk, None, len(pieces)
+            return spk, ref_path, len(pieces)
+
+        written = set()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_one, list(plan.items())))
+        for spk, ref_path, piece_count in results:
+            if not ref_path or not Path(ref_path).exists():
+                continue
+            for i, it in enumerate(self.queue_tts):
+                if not it.get("ref_wav") or i >= len(speakers) or speakers[i] != spk:
+                    continue
+                start = int(it.get("start_time_source") or it.get("start_time") or 0)
+                end = int(it.get("end_time_source") or it.get("end_time") or 0)
+                if line_uses_own_voice(start, end, plan.get(spk)):
+                    continue
+                it["ref_wav"] = ref_path
+            written.add(ref_path)
+            logger.debug(f'说话人 {spk} 使用共用参考音频 {ref_path}，片段数 {piece_count}')
+        return written

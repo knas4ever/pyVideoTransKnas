@@ -35,7 +35,7 @@ def run(*, translate_type=0,
         is_test=False,
         source_code="",
         target_code="",
-        uuid=None,is_cuda=False) -> Union[List, str, None]:
+        uuid=None,is_cuda=False,skip_cache=False,reference_pairs=None) -> Union[List, str, None]:
     translate_type = int(translate_type)
     real_source_code, real_target_code = get_source_target_code(show_source=source_code,show_target=target_code, translate_type=translate_type)
     kwargs = {
@@ -46,7 +46,9 @@ def run(*, translate_type=0,
         "uuid": uuid,
         "is_test": is_test,
         "is_cuda":is_cuda,
-        "translate_type": translate_type
+        "translate_type": translate_type,
+        "skip_cache": skip_cache,
+        "reference_pairs": reference_pairs or [],
     }
     logger.debug(f'字幕翻译前参数:{[{k:v} for k,v in kwargs.items() if k !="text_list"]}')
 

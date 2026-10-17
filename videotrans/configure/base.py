@@ -41,6 +41,11 @@ class BaseCon:
         return False
     # 所有窗口和任务信息通过队列交互
     def signal(self, **kwargs):
+        text = kwargs.get("text") or ""
+        msg_type = kwargs.get("type") or "logs"
+        notes = getattr(app_cfg, "web_log_queue", None)
+        if notes is not None and text and msg_type == "logs":
+            notes.put(str(text))
         if app_cfg.exit_soft: return
         if app_cfg.exec_mode=='cli':
             print(kwargs.get('text'))
@@ -57,12 +62,20 @@ class BaseCon:
 
     def _process_callback(self, data):
         _t=time.time()
-        if _t-self.last_down_time<1:
+        finished = False
+        if isinstance(data, str):
+            finished = data.endswith("100.00%") or data.endswith("100%")
+        elif isinstance(data, dict):
+            try:
+                finished = float(data.get("percent")) >= 100
+            except (TypeError, ValueError):
+                finished = False
+        if not finished and _t-self.last_down_time<1:
             return
         self.last_down_time=_t
         
         if isinstance(data, str):
-            return self.signal(text=tr('Downloading please wait') + data)
+            return self.signal(text=tr('Downloading please wait') + " " + data)
         if not isinstance(data, dict):
             return
         msg_type = data.get("type")

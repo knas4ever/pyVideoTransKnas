@@ -133,26 +133,54 @@ def precise_speed_up_audio(*, file_path:str=None, out:str=None, target_duration_
         logger.exception(f'音频加速失败:{e}')
 
 
-def cut_from_audio(*, ss, to, audio_file, out_file)->bool:
-    from . import help_srt
-    if not Path(audio_file).exists():
-        return False
-    Path(out_file).parent.mkdir(exist_ok=True, parents=True)
-    cmd = [
+def test_clip_target(source, folder, minutes):
+    """Separate file so a short test does not reuse the full film's output."""
+    source = Path(source)
+    return Path(folder) / f"{source.stem}-test-{int(minutes)}m{source.suffix}"
+
+
+def test_clip_args(source, dest, minutes):
+    """Copy the first ``minutes`` without re-encoding."""
+    return [
         "-y",
+        "-ss",
+        "0",
         "-i",
-        audio_file,
+        str(source),
+        "-t",
+        str(int(minutes) * 60),
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(dest),
+    ]
+
+
+def cut_audio_args(*, ss, to, audio_file, out_file):
+    """Seek in the input, then read. Output seeking decoded the whole film."""
+    from . import help_srt
+    return [
+        "-y",
         "-ss",
         help_srt.format_time(ss, '.'),
         "-to",
         help_srt.format_time(to, '.'),
+        "-i",
+        audio_file,
         "-ar",
         "16000",
         "-c:a",
         "pcm_s16le",
-        out_file
+        out_file,
     ]
-    return runffmpeg(cmd)
+
+
+def cut_from_audio(*, ss, to, audio_file, out_file)->bool:
+    if not Path(audio_file).exists():
+        return False
+    Path(out_file).parent.mkdir(exist_ok=True, parents=True)
+    return runffmpeg(cut_audio_args(ss=ss, to=to, audio_file=audio_file, out_file=out_file))
 
 
 def remove_silence_wav(

@@ -387,6 +387,7 @@
   "Truncate": "Truncate",
   "Video": "Video File",
   "Video + Subtitles + Dubbing in merge": "Merging Video, Subtitles, and Dubbing Audio...",
+  "Add dubbed audio track": "Lægger dubbet lydspor på den originale film...",
   "Video Auto Slow": "Auto Slow-Mo Video (Aligns audio/video sync; significantly increases processing time)",
   "Video Subtitles Merging": "Merge V/A/Srt",
   "Video and audio of the same name do not exist and cannot be merged": "Matching video and audio files not found for merging",

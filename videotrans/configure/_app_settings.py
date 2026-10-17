@@ -144,6 +144,7 @@ class AppSettings:
             "aisendsrt": True,
             "dont_notify": False,
             "video_codec": 264,
+            "mux_audio": True,
             "out_video_ext": ".mp4",
             "noise_separate_nums": 4,
             "aitrans_temperature": 0.1,

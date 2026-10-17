@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from videotrans.configure.config import params
+from videotrans.configure.config import logger, params
 from videotrans.translator._openaicompat import OpenAICampat
 
 
@@ -20,4 +20,28 @@ class LocalLLM(OpenAICampat):
         
 
         super().__post_init__()
+        # Gemma spends the reply on a hidden reasoning trace unless this is set.
+        self.extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def _unload(self):
+        """Drop the local model so Chatterbox can use the GPU."""
+        import requests
+
+        base = (self.api_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        if len(base) < 10:
+            return
+        try:
+            response = requests.post(
+                f"{base}/models/unload",
+                json={"model": self.model_name},
+                timeout=30,
+            )
+            logger.debug(f"Local LLM unload {response.status_code}: {response.text[:200]}")
+        except Exception as exc:
+            try:
+                logger.warning(f"Local LLM blev ikke læsset af: {exc}")
+            except Exception:
+                return
 

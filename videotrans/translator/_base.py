@@ -24,6 +24,8 @@ class BaseTrans(BaseCon):
     uuid: Optional[str] = None
     # 测试时不使用缓存
     is_test: bool = False
+    # 清理上次输出时也不读翻译缓存
+    skip_cache: bool = False
     # 原始语言代码
     source_code: str = ""
     # 目标语言代码
@@ -51,6 +53,8 @@ class BaseTrans(BaseCon):
     max_tokens:int=8192
     reasoning_effort:str=None
     extra_body:Union[dict,None]=None
+    # Uploaded subtitle pair used only as wording for nearby lines.
+    reference_pairs: list = field(default_factory=list)
 
     def __post_init__(self):
         super().__post_init__()
@@ -111,7 +115,7 @@ class BaseTrans(BaseCon):
         for i, it in enumerate(split_source_text):
             """ it=['你好啊我的朋友','第二行']  此时 _item_task 接收的是 list[str] """
             if self._exit(): return
-            self.signal(text=tr('starttrans') + f' {i} ')
+            self.signal(text=tr('starttrans') + f' {i + 1}/{len(split_source_text)} ')
             result = self._get_cache(it)
             if not result:
                 result = cleartext( self._item_task( ("\n".join(it)).strip() ) )
@@ -156,10 +160,14 @@ class BaseTrans(BaseCon):
         raws_list = []
         for i, it in enumerate(split_source_text):
             if self._exit(): return
-            self.signal(text=tr('starttrans') + f' {i} ')
+            self.signal(text=tr('starttrans') + f' {i + 1}/{len(split_source_text)} ')
             # 组成合法的srt格式字符串
             srt_str = "\n\n".join(
                 [f"{srt_dict['line']}\n{srt_dict['time']}\n{srt_dict['text'].strip()}" for srt_dict in it])
+            from videotrans.task._reference_srt import format_reference, references_for_cues
+            self._batch_reference = format_reference(
+                references_for_cues(it, self.reference_pairs or [])
+            )
             result = self._get_cache(srt_str)
             if not result:
                 result = self._item_task(srt_str.strip())
@@ -190,7 +198,7 @@ class BaseTrans(BaseCon):
         Path(file_cache).write_text(res_str, encoding='utf-8')
 
     def _get_cache(self, it) -> Union[str,None]:
-        if self.is_test: return
+        if self.is_test or self.skip_cache: return
         file_cache = TEMP_ROOT + f'/translate_cache/{self._get_key(it)}.txt'
         if Path(file_cache).exists():
             logger.debug(f'本次跳过翻译，使用缓存')
@@ -199,7 +207,9 @@ class BaseTrans(BaseCon):
 
     def _get_key(self, it) -> str:
         it=serial(it)
-        return get_md5(f'{self.translate_type}-{self.api_url}-{self.aisendsrt}-{self.model_name}-{self.source_code}-{self.target_code}-{it}')
+        reference = getattr(self, "_batch_reference", "") or ""
+        reference_key = f"-ref-{reference}" if reference else ""
+        return get_md5(f'{self.translate_type}-{self.api_url}-{self.aisendsrt}-{self.model_name}-{self.source_code}-{self.target_code}-song1-ref3-{reference_key}-{it}')
     
     def _set_context(self,target_code=None):
         if not self.text_list: return '' # LLM  error correction

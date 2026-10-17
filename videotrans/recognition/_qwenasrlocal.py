@@ -18,6 +18,20 @@ from videotrans.util.help_down import check_and_down_ms, check_and_down_hf
 from videotrans.util.help_misc import is_connect_hf
 
 
+def alignment_chunk_limits():
+    """Audio cuts the forced aligner can timestamp.
+
+    A chunk of one or two minutes stretches short lines across the silence
+    around them. Cuts stay on pauses and stop at 20 seconds.
+    """
+    return {
+        "min_speech_duration_ms": 2000,
+        "max_speech_duration_ms": 20000,
+        "min_silent_duration_ms": 500,
+        "max_merge_gap_ms": 400,
+    }
+
+
 @dataclass(repr=False)
 class QwenasrlocalRecogn(BaseRecogn):
 
@@ -87,8 +101,10 @@ class QwenasrlocalRecogn(BaseRecogn):
     def _cut(self,cut_audio_list_file):
         audio = AudioSegment.from_wav(self.audio_file)
         _len=len(audio)
-        _min_segments=60000#最小1分钟
-        _max_segments=120000#最大2分钟，减少显存占用
+        # 1–2 minute chunks make the forced aligner stretch word times.
+        # Keep each chunk on a pause and under 20 seconds.
+        limits = alignment_chunk_limits()
+        _max_segments = limits["max_speech_duration_ms"]
         if _len<=_max_segments:
             _endraw=ms_to_time_string(ms=_len)
             Path(cut_audio_list_file).write_text(json.dumps([
@@ -111,9 +127,7 @@ class QwenasrlocalRecogn(BaseRecogn):
         kw = {
             "input_wav": self.audio_file,
             "threshold": float(settings.get('threshold', 0.45)),
-            "min_speech_duration_ms": _min_segments,
-            "max_speech_duration_ms": _max_segments,
-            "min_silent_duration_ms": 2000
+            **limits,
         }
         self.speech_timestamps=get_speech_timestamp_silero(**kw)
 

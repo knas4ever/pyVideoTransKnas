@@ -389,6 +389,7 @@
   "Truncate": "截断",
   "Video": "视频文件",
   "Video + Subtitles + Dubbing in merge": "视频+字幕+配音合并中",
+  "Add dubbed audio track": "正在把配音轨加到原始影片...",
   "Video Auto Slow": "视频自动慢速处理，用于辅助声音画面字幕对齐，注意选中该项【翻译耗时将显著增加】",
   "Video Subtitles Merging": "媒体合并",
   "Video and audio of the same name do not exist and cannot be merged": "不存在同名视频和音频，无法合并",

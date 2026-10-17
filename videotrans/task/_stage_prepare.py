@@ -45,10 +45,17 @@ class PrepareMixin:
             shutil.copy2(raw_instrument, self.cfg.instrument)
 
         if not self.is_audio_trans and self.cfg.app_mode != 'tiqu':
-            app_cfg.queue_novice[self.uuid] = 'ing'
-            if not self.is_copy_video:
-                self.signal(text=tr("Video needs transcoded and take a long time.."))
-            run_in_threadpool(self._split_novoice_byraw)
+            from videotrans.task._mux import keeps_original_streams
+            if keeps_original_streams(
+                mux_audio=settings.get("mux_audio", True),
+                video_autorate=self.cfg.video_autorate,
+                subtitle_type=self.cfg.subtitle_type,
+            ):
+                app_cfg.queue_novice[self.uuid] = 'end'
+                logger.debug("Mux: originalt billede og lyd beholdes. Dub-sporet lægges på til sidst.")
+            else:
+                app_cfg.queue_novice[self.uuid] = 'ing'
+                run_in_threadpool(self._split_novoice_byraw)
         else:
             app_cfg.queue_novice[self.uuid] = 'end'
 
@@ -104,8 +111,9 @@ class PrepareMixin:
                             spk_list.append(groups.group(1))
                             # 从字幕中删掉说话人标识
                             it['text']=it['text'].replace(groups.group(0),'')
-                    if spk_list:                            
-                        Path(self.cfg.target_dir + "/speaker.json").write_text(json.dumps(spk_list), encoding='utf-8')
+                    if spk_list:
+                        if not self.cfg.clear_cache:
+                            Path(self.cfg.target_dir + "/speaker.json").write_text(json.dumps(spk_list), encoding='utf-8')
                         txt = get_srt_from_list(source_srt_list)
                         with open(self.cfg.source_sub, "w", encoding="utf-8", errors="ignore") as f:
                             f.write(txt)
@@ -118,53 +126,29 @@ class PrepareMixin:
 
     def _split_novoice_byraw(self):
         import os
-        from videotrans.configure.config import settings
-        cmd = [
-            "-y",
-            "-fflags",
-            "+genpts",
-            "-i",
-            self.cfg.name,
-            "-an",
-            "-c:v",
-            "copy" if self.is_copy_video else f"libx264"
-        ]
         _name = os.path.basename(self.cfg.novoice_mp4)
-        enc_qua = [] if self.is_copy_video else ['-crf', '18']
-        if self.is_copy_video or settings.get('force_lib'):
-            return runffmpeg(cmd + enc_qua + [_name], noextname=self.uuid, cmd_dir=self.cfg.cache_folder)
-
+        # Keep the original picture and drop only the sound. A 10-bit HEVC
+        # film does not need a full libx264 re-encode for the later mux.
         try:
-            hw_decode_args, _, vcodec, enc_args = self._get_hard_cfg(codec="264")
-            cmd = [
-                "-y",
-                "-fflags",
-                "+genpts",
-            ]
-            cmd += hw_decode_args
-
-            cmd += [
-                "-i",
-                self.cfg.name,
-                "-an",
-                "-c:v",
-                vcodec,
-                _name
-            ]
-            self._subprocess(cmd)
-            app_cfg.queue_novice[self.uuid] = 'end'
-        except Exception as e:
-            logger.exception(f'硬件分离无声视频失败,尝试软分离 {e}', exc_info=True)
             return runffmpeg([
                 "-y",
-                "-fflags",
-                "+genpts",
-                "-i",
-                self.cfg.name,
+                "-fflags", "+genpts",
+                "-i", self.cfg.name,
+                "-map", "0:v:0",
                 "-an",
-                "-c:v",
-                "libx264",
-                _name
+                "-c:v", "copy",
+                _name,
+            ], noextname=self.uuid, cmd_dir=self.cfg.cache_folder)
+        except Exception as e:
+            logger.exception(f'Kopi af billedsporet fejlede, omkoder: {e}', exc_info=True)
+            self.signal(text=tr("Video needs transcoded and take a long time.."))
+            return runffmpeg([
+                "-y",
+                "-fflags", "+genpts",
+                "-i", self.cfg.name,
+                "-an",
+                "-c:v", "libx264",
+                _name,
             ], noextname=self.uuid, cmd_dir=self.cfg.cache_folder, force_cpu=True)
 
     def _split_audio_byraw(self, is_separate=False):

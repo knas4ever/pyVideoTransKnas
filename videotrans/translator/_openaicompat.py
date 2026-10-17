@@ -56,14 +56,17 @@ class OpenAICampat(BaseTrans):
             raise StopTask(f'API URL is error: {self.api_url}')
         
         text = data
-        
+        content = self.prompt.replace('{batch_input}', f'{text}')
+        if '{reference}' in content:
+            content = content.replace('{reference}', getattr(self, "_batch_reference", "") or "None.")
+
         message = [
             {
                 'role': 'system',
                 'content': 'You are a top-tier Subtitle Translation Engine.'},
             {
                 'role': 'user',
-                'content': self.prompt.replace('{batch_input}', f'{text}')
+                'content': content
             },
         ]
 

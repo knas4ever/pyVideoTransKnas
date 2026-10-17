@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import re
 import shutil
 import time
@@ -7,9 +8,26 @@ from pathlib import Path
 from videotrans.configure._paths import DUBBING_CACHE
 from videotrans.configure.config import tr, app_cfg, settings, logger
 from videotrans.configure.excepts import DubbingSrtError
-from videotrans.tts import run as run_tts, SUPPORT_CLONE
+from videotrans.tts import run as run_tts, SUPPORT_CLONE, CHATTERBOX_TTS
+from videotrans.task._speaker_refs import source_index_for_cue
+from videotrans.tts._designations import speakable_text
 from videotrans.util.help_misc import get_md5, vail_file
 from videotrans.util.help_srt import get_subtitle_from_srt, delete_punc
+
+
+def dubbing_cache_key(*, text, voice, rate, volume, pitch, tts_type, silence, ref_wav=""):
+    """Same words with another cloned voice must not reuse the old wav."""
+    ref_id = ""
+    path = Path(ref_wav) if ref_wav else None
+    if path and path.is_file():
+        digest = hashlib.md5()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        ref_id = digest.hexdigest()
+    return get_md5(
+        f"{text}-{voice}-{rate}-{volume}-{pitch}-{tts_type}-{silence}-{ref_id}"
+    )
 
 
 class DubbingMixin:
@@ -55,12 +73,16 @@ class DubbingMixin:
         voice_role = self.cfg.voice_role
         logger.debug(f'{line_roles=}')
         _lang=self.cfg.detect_language.split('-')[0]
+        speakers = self._load_speaker_ids()
         for i, it in enumerate(subs):
             if it['end_time'] < it['start_time'] or not it['text'].strip():
                 continue
             voice = line_roles.get(f'{it["line"]}', voice_role) if line_roles else voice_role
-
-            _key = get_md5(f"{self.cfg.target_language_code}-{it['text']}-{voice}-{rate}-{self.cfg.volume}-{self.cfg.pitch}-{self.cfg.tts_type}-{settings.get('remove_dubb_silence', True)}-{settings.get('remove_dubb_all_silence', True)}-{settings.get('remove_dubb_silence_level', 'default')}")
+            src_index = source_index_for_cue(it, source_subs)
+            src = source_subs[src_index] if src_index is not None else None
+            speaker = speakers[src_index] if src_index is not None and src_index < len(speakers) else ""
+            if src_index is not None and src_index != i:
+                logger.debug(f"linje {it['line']} bruger taler {speaker} fra kildelinje {src_index + 1}")
 
             tmp_dict = {
                 "text": it['text'],
@@ -69,25 +91,25 @@ class DubbingMixin:
                 "end_time": it['end_time'],
                 "startraw": it['startraw'],
                 "endraw": it['endraw'],
-                "ref_text": source_subs[i]['text'] if source_subs and i < len(source_subs) else '',
-                "start_time_source": source_subs[i]['start_time'] if source_subs and i < len(source_subs) else it[
-                    'start_time'],
-                "end_time_source": source_subs[i]['end_time'] if source_subs and i < len(source_subs) else it[
-                    'end_time'],
+                "ref_text": src['text'] if src else '',
+                "start_time_source": src['start_time'] if src else it['start_time'],
+                "end_time_source": src['end_time'] if src else it['end_time'],
+                "speaker": speaker,
                 "role": voice,
                 "rate": rate,
                 "volume": self.cfg.volume,
                 "pitch": self.cfg.pitch,
                 "tts_type": self.cfg.tts_type,
-                "filename": f"{self.cfg.cache_folder}/{i}-{_key}.wav"
+                "filename": f"{self.cfg.cache_folder}/{i}.wav"
             }
-            _dubbing_cache=f'{DUBBING_CACHE}/{_key}.wav'
-            if vail_file(_dubbing_cache):
-                # 直接使用缓存
-                shutil.copy2(_dubbing_cache,tmp_dict['filename'])
             if str(voice).strip().lower() == 'clone' and self.cfg.tts_type in SUPPORT_CLONE:
                 tmp_dict['ref_wav'] = f"{self.cfg.cache_folder}/clone-{i}.wav"
                 tmp_dict['ref_language'] = _lang
+            if self.cfg.tts_type == CHATTERBOX_TTS:
+                spoken = speakable_text(tmp_dict["text"])
+                if spoken != tmp_dict["text"]:
+                    tmp_dict["speak_text"] = spoken
+                    logger.debug(f"Chatterbox staver linje {tmp_dict['line']}: {spoken}")
             queue_tts.append(tmp_dict)
 
         self.queue_tts = copy.deepcopy(queue_tts)
@@ -97,6 +119,7 @@ class DubbingMixin:
 
         if len([it.get("ref_wav") for it in self.queue_tts if it.get("ref_wav")]) > 0:
             self._create_ref_from_vocal()
+        self._reuse_dubbing_cache()
 
         run_tts(
             queue_tts=self.queue_tts,
@@ -122,3 +145,31 @@ class DubbingMixin:
                     shutil.copy2(it['filename'], name)
         
         self._save_srt_target(self.queue_tts, self.cfg.target_sub)
+
+    def _reuse_dubbing_cache(self) -> None:
+        silence = (
+            settings.get("remove_dubb_silence", True),
+            settings.get("remove_dubb_all_silence", True),
+            settings.get("remove_dubb_silence_level", "default"),
+        )
+        for index, it in enumerate(self.queue_tts):
+            key = dubbing_cache_key(
+                text=f"{self.cfg.target_language_code}-{it.get('speak_text') or it['text']}",
+                voice=it.get("role"),
+                rate=it.get("rate"),
+                volume=it.get("volume"),
+                pitch=it.get("pitch"),
+                tts_type=it.get("tts_type"),
+                silence=silence,
+                ref_wav=it.get("ref_wav") or "",
+            )
+            it["filename"] = f"{self.cfg.cache_folder}/{index}-{key}.wav"
+            cached = f"{DUBBING_CACHE}/{key}.wav"
+            if (
+                self.cfg.clear_cache
+                or getattr(self, "force_new_dubbing", False)
+                or not vail_file(cached)
+            ):
+                continue
+            shutil.copy2(cached, it["filename"])
+            logger.debug(f"复用配音缓存 行{it.get('line')}")

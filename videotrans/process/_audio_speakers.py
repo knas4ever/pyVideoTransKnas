@@ -246,7 +246,7 @@ def built_speakers(*, input_file, subtitles_file: str, speak_file: str, num_spea
             return audio, target_sample_rate
         return audio, sample_rate
 
-    def init_speaker_diarization(language, num_speakers=-1):
+    def init_speaker_diarization(language, num_speakers=-1, min_duration_off=0.5):
         import sherpa_onnx
         segmentation_model = f"{ROOT_DIR}/models/onnx/seg_model.onnx"
         embedding_extractor_model = (
@@ -267,57 +267,150 @@ def built_speakers(*, input_file, subtitles_file: str, speak_file: str, num_spea
             clustering=sherpa_onnx.FastClusteringConfig(
                 num_clusters=num_speakers, threshold=0.5
             ),
-            min_duration_on=0.3,
-            min_duration_off=0.5,
+            min_duration_on=0.2,
+            min_duration_off=min_duration_off,
         )
         if not _cf.validate():
             raise RuntimeError(
                 "Please check your config and make sure all required files exist"
             )
 
-        return sherpa_onnx.OfflineSpeakerDiarization(_cf)
+        return sherpa_onnx.OfflineSpeakerDiarization(_cf), embedding_extractor_model
 
     def _progress_callback(num_processed_chunk: int, num_total_chunks: int) -> int:
         return int(num_processed_chunk / num_total_chunks * 100 if num_total_chunks > 0 else 0)
 
-    def _get_diariz():
+    def _read_audio():
         audio, sample_rate = sf.read(input_file, dtype="float32", always_2d=True)
-        audio = audio[:, 0]
+        return audio[:, 0], sample_rate
 
-        sd = init_speaker_diarization(language, num_speakers)
-
-        target_sample_rate = sd.sample_rate
-        audio, sample_rate = resample_audio(audio, sample_rate, target_sample_rate)
-
+    def _run_model(min_duration_off):
+        audio, sample_rate = _read_audio()
+        sd, embedding_model = init_speaker_diarization(language, num_speakers, min_duration_off)
+        audio, sample_rate = resample_audio(audio, sample_rate, sd.sample_rate)
         if sample_rate != sd.sample_rate:
             raise RuntimeError(
                 f"Expected samples rate: {sd.sample_rate}, given: {sample_rate}"
             )
-
-        show_progress = True
-
-        if show_progress:
-            result = sd.process(audio, callback=_progress_callback).sort_by_start_time()
-        else:
-            result = sd.process(audio).sort_by_start_time()
-
+        result = sd.process(audio, callback=_progress_callback).sort_by_start_time()
         raw_output = []
         for r in result:
             raw_output.append({'start': r.start, 'end': r.end, 'speaker': f'spk{r.speaker}'})
-        return _normalize_diarizations(raw_output)
+        return _normalize_diarizations(raw_output), audio, sample_rate, embedding_model
+
+    def _embed_span(extractor, audio, sample_rate, start_ms, end_ms):
+        import numpy as np
+        start = max(int(start_ms / 1000 * sample_rate), 0)
+        end = min(int(end_ms / 1000 * sample_rate), len(audio))
+        if end - start < int(0.3 * sample_rate):
+            return None
+        chunk = np.ascontiguousarray(audio[start:end])
+        stream = extractor.create_stream()
+        stream.accept_waveform(sample_rate, chunk)
+        stream.input_finished()
+        if not extractor.is_ready(stream):
+            return None
+        return extractor.compute(stream)
+
+    def _split_segments_on_silence(diarizations, audio, sample_rate, min_gap_s=0.18, min_piece_s=0.45):
+        import numpy as np
+        frame = int(0.02 * sample_rate)
+        hop = max(int(0.01 * sample_rate), 1)
+        if frame < 1 or len(audio) <= frame:
+            return diarizations
+        rms = np.array([
+            float(np.sqrt(np.mean(audio[i:i + frame] ** 2)))
+            for i in range(0, len(audio) - frame, hop)
+        ])
+        pieces = []
+        for item in diarizations:
+            start_ms, end_ms = item["times"]
+            if end_ms - start_ms < 1200:
+                pieces.append(item)
+                continue
+            i0 = int(start_ms / 1000 * sample_rate) // hop
+            i1 = min(int(end_ms / 1000 * sample_rate) // hop, len(rms))
+            region = rms[i0:i1]
+            if len(region) < 5:
+                pieces.append(item)
+                continue
+            threshold = max(float(np.percentile(region, 80)) * 0.18, 1e-4)
+            gaps = []
+            gap_start = None
+            for index, value in enumerate(region):
+                if value < threshold:
+                    if gap_start is None:
+                        gap_start = index
+                elif gap_start is not None:
+                    if (index - gap_start) * hop / sample_rate >= min_gap_s:
+                        gaps.append((gap_start, index))
+                    gap_start = None
+            if not gaps:
+                pieces.append(item)
+                continue
+            cuts = [start_ms]
+            for gap_from, gap_to in gaps:
+                cuts.append(start_ms + int(gap_from * hop / sample_rate * 1000))
+                cuts.append(start_ms + int(gap_to * hop / sample_rate * 1000))
+            cuts.append(end_ms)
+            split = []
+            for left, right in zip(cuts[0::2], cuts[1::2]):
+                if right - left >= int(min_piece_s * 1000):
+                    split.append({"times": [left, right], "speaker": item["speaker"]})
+            pieces.extend(split if len(split) >= 2 else [item])
+        if len(pieces) != len(diarizations):
+            logger.debug(f'按静音切开长句：{[it["times"] for it in pieces]}')
+        return pieces
+
+    def _recluster(diarizations, audio, sample_rate, embedding_model):
+        import sherpa_onnx
+        from videotrans.task._speaker_split import cluster_by_cosine
+        long_items = [item for item in diarizations if item['times'][1] - item['times'][0] >= 400]
+        if len(long_items) < 2:
+            return diarizations
+        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
+            sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding_model)
+        )
+        vectors = []
+        usable = []
+        for item in long_items:
+            vector = _embed_span(extractor, audio, sample_rate, item['times'][0], item['times'][1])
+            if vector is None:
+                continue
+            usable.append(item)
+            vectors.append(vector)
+        if len(vectors) < 2:
+            return diarizations
+        labels = cluster_by_cosine(vectors, min_cosine=0.55)
+        if len(set(labels)) < 2:
+            return diarizations
+        for item, label in zip(usable, labels):
+            item['speaker'] = f'spk{label}'
+        logger.debug(f'短音频二次分说话人：{[(it["times"], it["speaker"]) for it in diarizations]}')
+        return diarizations
 
     try:
         _st = time.time()
         logger.debug(f'开始说话人分离,使用内置模型 {language=},{num_speakers=}')
         subtitles = json.loads(Path(subtitles_file).read_text(encoding='utf-8'))
-        diarizations = _get_diariz()
+        diarizations, audio, sample_rate, embedding_model = _run_model(0.5)
         if not diarizations:
             return False, 'Unknow error'
+        if len({item['speaker'] for item in diarizations}) < 2:
+            diarizations = _split_segments_on_silence(diarizations, audio, sample_rate)
+            diarizations = _recluster(diarizations, audio, sample_rate, embedding_model)
         diar_list = [[d['times'], d['speaker']] for d in diarizations]
         output = _assign_speakers(subtitles, diar_list)
         logger.debug(f'说话人分离成功结束,识别出个 {len(set(output))} 说话人,耗时：{int(time.time() - _st)}s')
         if output:
             Path(speak_file).write_text(json.dumps(output), encoding='utf-8')
+            spans = [
+                {"start": item["times"][0], "end": item["times"][1], "speaker": item["speaker"]}
+                for item in diarizations
+            ]
+            Path(speak_file).with_name("speaker_spans.json").write_text(
+                json.dumps(spans), encoding="utf-8"
+            )
             return True, None
         return False, "0 speakers"
     except Exception as e:

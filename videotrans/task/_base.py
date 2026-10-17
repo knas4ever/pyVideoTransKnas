@@ -225,6 +225,10 @@ class BaseTask(BaseCon):
 
             if _rs:
                 logger.debug('分离说话人成功完成')
+                try:
+                    self._split_overlapping_speakers()
+                except Exception:
+                    logger.exception('按说话人切开字幕失败，保留原字幕')
                 shutil.copy2(self.cfg.cache_folder + "/speaker.json", self.cfg.target_dir + "/speaker.json")
             else:
                 logger.error('分离失败说话人失败')
@@ -233,6 +237,82 @@ class BaseTask(BaseCon):
             logger.exception(f'说话人分离失败，跳过 {e}', exc_info=True)
 
         logger.debug(f'[说话人分离阶段结束耗时]:{time.time()-_st}s')
+
+    def _load_word_times(self):
+        words_path = Path(self.cfg.cache_folder) / "words.json"
+        if not words_path.is_file():
+            words_path = Path(self.cfg.target_dir) / "words.json"
+        if not words_path.is_file():
+            return []
+        try:
+            return json.loads(words_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _split_overlapping_speakers(self):
+        if not self.source_srt_list:
+            return
+        # An uploaded subtitle is the text the user asked to keep.
+        if getattr(self, "keep_imported_lines", False):
+            return
+        spans_path = Path(self.cfg.cache_folder) / "speaker_spans.json"
+        if not spans_path.is_file():
+            self._merge_cut_sentences()
+            return
+        try:
+            spans = json.loads(spans_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._merge_cut_sentences()
+            return
+        from videotrans.task._speaker_split import split_subtitle_lines
+        if len({item.get("speaker") for item in spans}) >= 2:
+            new_lines, speakers = split_subtitle_lines(
+                self.source_srt_list, spans, words=self._load_word_times()
+            )
+            if len(new_lines) != len(self.source_srt_list):
+                self.source_srt_list = new_lines
+                Path(self.cfg.cache_folder + "/speaker.json").write_text(
+                    json.dumps(speakers), encoding="utf-8"
+                )
+                logger.debug(f'按说话人切开字幕: {speakers}')
+        self._merge_cut_sentences()
+
+    def _merge_cut_sentences(self):
+        if not self.source_srt_list:
+            return
+        speaker_path = Path(self.cfg.cache_folder) / "speaker.json"
+        try:
+            speakers = json.loads(speaker_path.read_text(encoding="utf-8")) if speaker_path.is_file() else []
+        except (OSError, json.JSONDecodeError):
+            speakers = []
+        from videotrans.task._word_times import settle_sentence_times
+        word_times = self._load_word_times()
+        words_path = Path(self.cfg.cache_folder) / "words.json"
+        if not words_path.is_file():
+            words_path = Path(self.cfg.target_dir) / "words.json"
+        # Word times first, then join again. A short piece such as "Funny the"
+        # only looks like part of the next sentence once its real duration is known.
+        new_lines, new_speakers = settle_sentence_times(self.source_srt_list, speakers, word_times)
+        if word_times:
+            saved = Path(self.cfg.target_dir) / "words.json"
+            if words_path.is_file() and words_path.resolve() != saved.resolve():
+                shutil.copy2(words_path, saved)
+            logger.debug(f'按每个词的时间校正句子: {len(word_times)} 词')
+        before = [
+            (line.get("text"), int(line.get("start_time") or 0), int(line.get("end_time") or 0))
+            for line in self.source_srt_list
+        ]
+        after = [
+            (line.get("text"), int(line.get("start_time") or 0), int(line.get("end_time") or 0))
+            for line in new_lines
+        ]
+        if after == before:
+            return
+        self.source_srt_list = new_lines
+        self._save_srt_target(self.source_srt_list, self.cfg.source_sub)
+        if new_speakers:
+            speaker_path.write_text(json.dumps(new_speakers), encoding="utf-8")
+        logger.debug(f'合并被切开的句子: {len(new_speakers)} 行')
 
 
     async def _edgetts_single(self, target_audio, kwargs):

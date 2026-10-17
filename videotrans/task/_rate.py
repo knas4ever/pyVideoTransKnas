@@ -442,6 +442,11 @@ class SpeedRate:
         """
         tools.set_process(text=tr("Calculating sync adjustments"), uuid=self.uuid)
 
+        if self.should_audiorate and not self.should_videorate:
+            from videotrans.task._dub_gap import move_long_lines_earlier
+            for index, borrow in move_long_lines_earlier(self.queue_tts):
+                logger.debug(f'字幕{index} starter {borrow}ms tidligere for at undgå hård acceleration')
+
         for i, it in enumerate(self.queue_tts):
             source_duration = it['source_duration']
             if source_duration <= 0:
@@ -739,25 +744,32 @@ class SpeedRate:
         total_audio_duration = 0
 
         for i, it in enumerate(self.queue_tts):
-
-            prev_end = 0 if i == 0 else self.queue_tts[i - 1].get('end_pos_for_concat', 0)
-            start_time = it['start_time']
-            # 前面静音区间
-            gap = start_time - prev_end
-
-            if not self.remove_silent_mid and gap > 0:
-                audio_concat_list.append(self._create_silen_file(f"gap_{i}", gap))
-                total_audio_duration += gap
-
+            cue_start = int(it['start_time'])
+            cue_end = int(it['end_time'])
             dubb_len = 0
+            dubb_path = ""
             if it.get('filename') and Path(it['filename']).exists():
-                audio_concat_list.append(it['filename'])
-                dubb_len = len(AudioSegment.from_file(it['filename']))
+                dubb_path = it['filename']
+                dubb_len = len(AudioSegment.from_file(dubb_path))
             elif it.get('filename'):
-                dur = max(0, it['end_time'] - it['start_time'])
-                if dur > 0:
-                    audio_concat_list.append(self._create_silen_file(f"sub_{i}", dur))
-                    dubb_len = dur
+                dubb_len = max(0, cue_end - cue_start)
+                if dubb_len > 0:
+                    dubb_path = self._create_silen_file(f"sub_{i}", dubb_len)
+            # Center a real dub on the original cue. Keep the whole line: a long
+            # one starts early, and the next line waits only for what still overlaps.
+            from videotrans.task._dub_gap import silence_before_centered
+            if self.remove_silent_mid:
+                lead = 0
+            elif dubb_len > 0:
+                lead = silence_before_centered(total_audio_duration, cue_start, cue_end, dubb_len)
+            else:
+                lead = max(0, cue_start - total_audio_duration)
+            if lead > 0:
+                audio_concat_list.append(self._create_silen_file(f"gap_{i}", lead))
+                total_audio_duration += lead
+
+            if dubb_len > 0 and dubb_path:
+                audio_concat_list.append(dubb_path)
 
             total_audio_duration += dubb_len
             it['end_pos_for_concat'] = total_audio_duration

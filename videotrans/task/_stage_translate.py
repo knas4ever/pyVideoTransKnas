@@ -1,4 +1,5 @@
 import copy
+import json
 import shutil
 import time
 from pathlib import Path
@@ -34,11 +35,22 @@ class TranslateMixin:
             uuid=self.uuid,
             source_code=self.cfg.source_language_code,
             target_code=self.cfg.target_language_code,
-            is_cuda=self.cfg.is_cuda
+            is_cuda=self.cfg.is_cuda,
+            skip_cache=bool(
+                self.cfg.clear_cache or getattr(self, "force_new_dubbing", False)
+            ),
+            reference_pairs=getattr(self, "reference_pairs", None),
         )
         if self._exit():  return
 
         target_srt = self.check_target_sub(rawsrt, target_srt)
+        from videotrans.task._song_cues import without_song_cues
+        rawsrt, target_srt, dropped_at = without_song_cues(rawsrt, target_srt)
+        if dropped_at:
+            logger.debug(f"Springer {len(dropped_at)} sungne linjer over")
+            self._save_srt_target(rawsrt, self.cfg.source_sub)
+            self.source_srt_list = rawsrt
+            self._drop_speakers_at(dropped_at, len(rawsrt) + len(dropped_at))
         # 删除原字幕标点
         if self.cfg.fix_punc==2:
             for it in rawsrt:
@@ -74,3 +86,20 @@ class TranslateMixin:
 
         self.signal(text=tr('endtrans'))
         logger.debug(f'[字幕翻译阶段结束耗时]:{time.time()-_st}s')
+
+    def _drop_speakers_at(self, indexes, original_len):
+        drop = set(indexes)
+        for folder in (self.cfg.cache_folder, self.cfg.target_dir):
+            path = Path(folder) / "speaker.json"
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, list) or len(data) != original_len:
+                continue
+            path.write_text(
+                json.dumps([item for i, item in enumerate(data) if i not in drop]),
+                encoding="utf-8",
+            )

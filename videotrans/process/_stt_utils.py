@@ -164,10 +164,16 @@ def _resegment(texts, language='en', max_speech_ms=6000, min_speech_ms=3000, log
       _comma_punc.add(" ")
     # 原text的结尾标记为标点，以便应用原始断句
 
+    def visible_word(text):
+        return str(text or "").replace(origin_end, "").strip()
+
     def has_punc(text, punc_set):
-        if not text:
-            return False
-        return text[-1] in punc_set or text.strip()[-1] in punc_set
+        bare = visible_word(text)
+        return bool(bare) and bare[-1] in punc_set
+
+    def sentence_finished(text):
+        bare = visible_word(text)
+        return bool(bare) and bare[-1] in ".?!。？！"
 
     def build_text(chunk_words):
         # 预先移除空格
@@ -193,6 +199,9 @@ def _resegment(texts, language='en', max_speech_ms=6000, min_speech_ms=3000, log
         if _t and _t[-1] and 'word' in _t[-1]:
             _t[-1]['word']+=origin_end
             all_words.extend(_t)
+
+    from videotrans.task._word_times import save_word_times
+    save_word_times(all_words, logs_file)
 
     # 某些特殊情况下，whisper返回数据中存在 text 但 words 为空，即不存在字级时间戳
     if not all_words or no_resegment:
@@ -246,12 +255,35 @@ def _resegment(texts, language='en', max_speech_ms=6000, min_speech_ms=3000, log
             current_duration = prev_word_end_ms - chunk_start_ms if prev_word_end_ms else 0
 
             # 间隙大于0
-            if pause_ms > 0 and len(current_chunk) >= _min_words and current_duration >= min_speech_ms:
+            # A real pause ends the sentence even when the cue is still under
+            # min_speech_ms. Waiting for 3 seconds glues the next sentence on
+            # and gives both the wrong timestamp.
+            new_sentence = pause_ms >= 700 or (
+                pause_ms >= 280
+                and w_text[:1].isupper()
+                and not prev_word_text[:1].isupper()
+            )
+            # A full stop ends the cue even when the next word follows at once.
+            # Waiting for 3 seconds keeps a whole exchange in one sentence.
+            bare_prev = visible_word(prev_word_text)
+            sentence_end = (
+                has_punc(prev_word_text, end_punc)
+                and bare_prev.lower() not in {
+                    "mr.", "mrs.", "ms.", "dr.", "st.", "jr.", "sr.", "vs.", "etc.", "prof."
+                }
+            )
+            if sentence_end and len(current_chunk) >= _min_words:
+                should_split = True
+            elif (
+                pause_ms > 0
+                and len(current_chunk) >= _min_words
+                and new_sentence
+                and current_duration >= 400
+            ):
+                should_split = True
+            elif pause_ms > 0 and len(current_chunk) >= _min_words and current_duration >= min_speech_ms:
                 # 遇到强标点结束
                 if has_punc(prev_word_text, end_punc):
-                    should_split = True
-                # 遇到明显的长静音停顿 (>= 400ms)
-                elif pause_ms >= 400:
                     should_split = True
                 # 遇到短停顿 (>= 100ms) 且伴随逗号等弱标点
                 elif has_punc(prev_word_text, _comma_punc) and pause_ms >= 100:
@@ -289,8 +321,17 @@ def _resegment(texts, language='en', max_speech_ms=6000, min_speech_ms=3000, log
 
     # 最后剩余
     if current_chunk:
-        if final_segments and prev_word_end_ms-chunk_start_ms< min_speech_ms:
-            final_segments[-1]['text']+= (" " if use_space else '')+build_text(current_chunk)
+        tail_text = build_text(current_chunk)
+        tail_ms = prev_word_end_ms - chunk_start_ms if chunk_start_ms is not None else 0
+        # A short capital word is the next sentence. Do not glue it backwards.
+        previous_ended = bool(final_segments) and sentence_finished(final_segments[-1]['text'])
+        if (
+            final_segments
+            and tail_ms < min_speech_ms
+            and not tail_text[:1].isupper()
+            and not previous_ended
+        ):
+            final_segments[-1]['text']+= (" " if use_space else '')+tail_text
             final_segments[-1]['end']=prev_word_end_ms
         else:
             final_segments.append({
@@ -312,6 +353,12 @@ def _resegment(texts, language='en', max_speech_ms=6000, min_speech_ms=3000, log
 
         # _merged的最后一个超长时，并且当前不是final_segments最后一个时，直接插入
         if _last_duration >= max_speech_ms and idx < _len - 1:
+            _merged.append(seg)
+            continue
+
+        # A capital sentence keeps the time of its own words.
+        # So does the line after a finished sentence, even when it is short.
+        if seg['text'][:1].isupper() or sentence_finished(_merged[-1]['text']):
             _merged.append(seg)
             continue
 

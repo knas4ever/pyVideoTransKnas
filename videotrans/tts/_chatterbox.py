@@ -1,3 +1,4 @@
+import gc
 import json
 import time
 from dataclasses import dataclass
@@ -33,12 +34,20 @@ class ChatterBoxTTS(BaseTTS):
         return True
 
     def _exec(self):
+        # Re-dubbing keeps the in-process loop. A film is dubbed in a fresh
+        # process per batch so the model is not added to the WebUI's memory.
+        if not self.is_redubb:
+            return self._exec_batched()
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        import inspect
         device=settings.get('device_name','auto')
         if device=='auto':
             device='cuda' if self.is_cuda else mps_or_cpu()
         logger.debug(f'Chatterbox running on {device}')
-        model = ChatterboxMultilingualTTS.from_local(self.local_dir, device=device,  t3_model="v3")
+        load_kwargs = {"device": device}
+        if "t3_model" in inspect.signature(ChatterboxMultilingualTTS.from_local).parameters:
+            load_kwargs["t3_model"] = "v3"
+        model = ChatterboxMultilingualTTS.from_local(self.local_dir, **load_kwargs)
 
         ok, err = 0, 0
         _except = None
@@ -46,7 +55,6 @@ class ChatterBoxTTS(BaseTTS):
         exaggeration = float(params.get("chatterbox_exaggeration", '0.5'))
         lang = self.language.split('-')[0]
         queue_tts=self.queue_tts
-        # 循环，用于轮询重新配音数据，非重新配音时，第一轮直接返回
         while 1:
             if self.is_redubb and Path(REDUBB_STATUS_FILE).exists():
                 return True
@@ -70,7 +78,7 @@ class ChatterBoxTTS(BaseTTS):
                     logger.warn('无参考音频，使用内置音色')
                 try:
                     self.signal(text=f'{tr("Dubbing")} {i}/{self.len}')
-                    wav_tensor = model.generate(item['text'], exaggeration=exaggeration, cfg_weight=cfg_weight,
+                    wav_tensor = model.generate(item.get('speak_text') or item['text'], exaggeration=exaggeration, cfg_weight=cfg_weight,
                                                 language_id=lang, audio_prompt_path=ref_wav)
                     wav_tensor = wav_tensor.detach().cpu()
                     if wav_tensor.ndim == 2:
@@ -102,3 +110,55 @@ class ChatterBoxTTS(BaseTTS):
 
         self.signal(text=msg)
         logger.debug(f'ChatterBox 配音结束：{msg}')
+
+    def _exec_batched(self):
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        pending = [it for it in self.queue_tts if not vail_file(it.get("filename"))]
+        batch = 20
+        cfg_weight = float(params.get("chatterbox_cfg_weight", "0.5"))
+        exaggeration = float(params.get("chatterbox_exaggeration", "0.5"))
+        total = len(self.queue_tts)
+        for start in range(0, len(pending), batch):
+            chunk = pending[start:start + batch]
+            title = f"ChatterBox {start + 1}-{start + len(chunk)}/{total}"
+            self._run_chunk(chunk, title, cfg_weight, exaggeration)
+            gc.collect()
+
+    def _run_chunk(self, chunk, title, cfg_weight, exaggeration):
+        from videotrans.process.chatterbox_tts import _write_silence, chatterbox_fun
+
+        queue_file = f"{Path(chunk[0]['filename']).parent}/chatterbox-{time.time()}.json"
+        Path(queue_file).write_text(json.dumps(chunk, ensure_ascii=False), encoding="utf-8")
+        try:
+            self._new_process(
+                callback=chatterbox_fun,
+                title=title,
+                is_cuda=self.is_cuda,
+                kwargs={
+                    "queue_tts_file": queue_file,
+                    "language": self.language.split("-")[0],
+                    "is_cuda": self.is_cuda,
+                    "local_dir": self.local_dir,
+                    "cfg_weight": cfg_weight,
+                    "exaggeration": exaggeration,
+                },
+            )
+        except Exception as exc:
+            logger.exception(f"{title} failed: {exc}")
+            if len(chunk) == 1:
+                _write_silence(chunk[0])
+                logger.error(
+                    f"Chatterbox line left silent: {(chunk[0].get('text') or '')[:40]}"
+                )
+                return
+            logger.error(f"{title} crashed. Retrying {len(chunk)} lines one at a time.")
+            for index, item in enumerate(chunk, start=1):
+                if vail_file(item.get("filename")):
+                    continue
+                self._run_chunk([item], f"{title} line {index}", cfg_weight, exaggeration)
